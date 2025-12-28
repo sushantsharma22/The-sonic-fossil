@@ -1,11 +1,23 @@
 /**
  * AudioEngine: Captures microphone audio, writes PCM into a SharedArrayBuffer
  * ring buffer for the worker. Also renders a thin waveform HUD.
+ * 
+ * ENHANCED: Source separation support, AnalyserNode for spectrogram
  */
 
 export type AudioEngineOptions = {
   onConfidence?: (c: number) => void;
+  onSeparatedSources?: (sources: SeparatedSource[]) => void;
+  enableSeparation?: boolean;
 };
+
+export interface SeparatedSource {
+  sourceId: number;
+  audioData: Float32Array;
+  dominantFrequency: number;
+  energy: number;
+  spectralCentroid: number;
+}
 
 class RingBuffer {
   sab: SharedArrayBuffer;
@@ -43,14 +55,69 @@ export class AudioEngine {
   private waveformCanvas?: HTMLCanvasElement;
   private waveformCtx?: CanvasRenderingContext2D | null;
   public worker?: Worker;
+  public separationWorker?: Worker;
   private ring: RingBuffer;
   private onConfidence?: (c: number) => void;
+  private onSeparatedSources?: (sources: SeparatedSource[]) => void;
   private isInitialized = false;
+  private enableSeparation: boolean;
+  
+  // AnalyserNode for spectrogram visualization
+  public analyserNode?: AnalyserNode;
+  
+  // Separation buffer (accumulate 2 seconds of audio)
+  private separationBuffer: Float32Array = new Float32Array(0);
+  private separationBufferIndex = 0;
+  private readonly SEPARATION_CHUNK_SIZE = 96000; // 2 seconds @ 48kHz
 
   constructor(opts: AudioEngineOptions = {}) {
     this.onConfidence = opts.onConfidence;
+    this.onSeparatedSources = opts.onSeparatedSources;
+    this.enableSeparation = opts.enableSeparation ?? false;
     // 10 seconds @ 48kHz ~ 480k samples, choose 1M for headroom
     this.ring = new RingBuffer(1_000_000);
+    this.separationBuffer = new Float32Array(this.SEPARATION_CHUNK_SIZE);
+  }
+  
+  /**
+   * Enable or disable source separation
+   */
+  setEnableSeparation(enabled: boolean): void {
+    this.enableSeparation = enabled;
+    if (enabled && !this.separationWorker && this.isInitialized) {
+      this.initSeparationWorker();
+    } else if (!enabled && this.separationWorker) {
+      this.separationWorker.postMessage({ type: 'dispose' });
+      this.separationWorker.terminate();
+      this.separationWorker = undefined;
+    }
+  }
+  
+  /**
+   * Initialize the separation worker
+   */
+  private initSeparationWorker(): void {
+    if (this.separationWorker) return;
+    
+    this.separationWorker = new Worker(
+      new URL('./workers/SeparationWorker.ts', import.meta.url),
+      { type: 'module' }
+    );
+    
+    this.separationWorker.onmessage = (ev) => {
+      const msg = ev.data;
+      if (msg.type === 'separated' && this.onSeparatedSources) {
+        this.onSeparatedSources(msg.sources);
+      } else if (msg.type === 'ready') {
+        console.log('[AudioEngine] Separation worker ready');
+      }
+    };
+    
+    this.separationWorker.postMessage({
+      type: 'init',
+      sampleRate: this.ctx?.sampleRate || 48000,
+      maxSources: 4
+    });
   }
 
   async init() {
@@ -76,6 +143,12 @@ export class AudioEngine {
     });
     
     const src = this.ctx.createMediaStreamSource(this.stream);
+    
+    // Create AnalyserNode for spectrogram visualization
+    this.analyserNode = this.ctx.createAnalyser();
+    this.analyserNode.fftSize = 2048;
+    this.analyserNode.smoothingTimeConstant = 0.3;
+    src.connect(this.analyserNode);
 
     // Use ScriptProcessor for simplicity (deprecated but widely supported)
     // Buffer size of 4096 for better performance
@@ -84,8 +157,13 @@ export class AudioEngine {
       const input = e.inputBuffer.getChannelData(0);
       this.ring.write(input);
       this.drawWaveform(input);
+      
+      // Send to separation worker if enabled
+      if (this.enableSeparation && this.separationWorker) {
+        this.accumulateForSeparation(input);
+      }
     };
-    src.connect(this.processor);
+    this.analyserNode.connect(this.processor);
     this.processor.connect(this.ctx.destination);
 
     // Start worker
@@ -108,8 +186,48 @@ export class AudioEngine {
       sab: this.ring.sab,
       sampleRate: this.ctx.sampleRate
     });
+    
+    // Initialize separation worker if enabled
+    if (this.enableSeparation) {
+      this.initSeparationWorker();
+    }
 
     this.isInitialized = true;
+  }
+  
+  /**
+   * Accumulate audio samples for source separation
+   */
+  private accumulateForSeparation(input: Float32Array): void {
+    // Copy input to buffer
+    const remaining = this.SEPARATION_CHUNK_SIZE - this.separationBufferIndex;
+    const toCopy = Math.min(remaining, input.length);
+    
+    this.separationBuffer.set(
+      input.subarray(0, toCopy),
+      this.separationBufferIndex
+    );
+    this.separationBufferIndex += toCopy;
+    
+    // When buffer is full, send to separation worker
+    if (this.separationBufferIndex >= this.SEPARATION_CHUNK_SIZE) {
+      this.separationWorker?.postMessage({
+        type: 'process',
+        audioData: this.separationBuffer.slice() // Copy buffer
+      });
+      
+      // Reset buffer with 50% overlap
+      const halfSize = this.SEPARATION_CHUNK_SIZE / 2;
+      this.separationBuffer.copyWithin(0, halfSize);
+      this.separationBufferIndex = halfSize;
+      
+      // Copy remaining input if any
+      if (toCopy < input.length) {
+        const extra = input.subarray(toCopy);
+        this.separationBuffer.set(extra, this.separationBufferIndex);
+        this.separationBufferIndex += extra.length;
+      }
+    }
   }
 
   setWaveformCanvas(canvas?: HTMLCanvasElement | null) {
@@ -153,20 +271,35 @@ export class AudioEngine {
   dispose() {
     try {
       this.processor?.disconnect();
+      this.analyserNode?.disconnect();
       this.stream?.getTracks().forEach(t => t.stop());
       this.ctx?.close();
       this.worker?.postMessage({ type: 'dispose' });
       this.worker?.terminate();
+      this.separationWorker?.postMessage({ type: 'dispose' });
+      this.separationWorker?.terminate();
       this.waveformCtx = null;
       this.isInitialized = false;
       this.worker = undefined;
+      this.separationWorker = undefined;
+      this.analyserNode = undefined;
       this.ctx = undefined;
       this.processor = undefined;
       this.stream = undefined;
+      // Reset separation buffer
+      this.separationBuffer = new Float32Array(this.SEPARATION_CHUNK_SIZE);
+      this.separationBufferIndex = 0;
       // Create new ring buffer for next init
       this.ring = new RingBuffer(1_000_000);
     } catch (e) {
       console.warn('Dispose error:', e);
     }
+  }
+  
+  /**
+   * Get the AnalyserNode for external visualization (spectrogram)
+   */
+  getAnalyserNode(): AnalyserNode | null {
+    return this.analyserNode ?? null;
   }
 }

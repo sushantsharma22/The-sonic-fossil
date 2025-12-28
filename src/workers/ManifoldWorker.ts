@@ -13,8 +13,11 @@
  * in 20-dimensional acoustic feature space, DBSCAN identifies distinct clusters.
  */
 
-import DBSCAN from '@cdxoo/dbscan';
+import dbscan from '@cdxoo/dbscan';
 import { UMAP } from 'umap-js';
+
+// Type alias for DBSCAN function
+const DBSCAN = dbscan;
 
 // Types
 interface InitMessage {
@@ -27,7 +30,11 @@ interface DisposeMessage {
   type: 'dispose';
 }
 
-type WorkerMessage = InitMessage | DisposeMessage;
+interface ExportMessage {
+  type: 'export';
+}
+
+type WorkerMessage = InitMessage | DisposeMessage | ExportMessage;
 
 // Audio feature data sent to main thread for export
 interface AudioFeatureData {
@@ -57,6 +64,7 @@ interface ClusterStats {
   clusterLabels: Int32Array;
   clusterSizes: Array<{ id: number; size: number }>;
   clusterCentroids: Array<{ x: number; y: number; z: number }>;
+  silhouetteScore: number;
 }
 
 // Shared buffer state
@@ -104,6 +112,10 @@ let lastClusterTime = 0;
 let dbscanEpsilon = 0.3; // Starting epsilon (auto-tuned)
 let lastClusterStats: ClusterStats | null = null;
 let lastEpsilonTuneCount = 0;
+
+// Deprecated: History for temporal variation (used by featuresToPosition which is deprecated)
+const HISTORY_SIZE = 10;
+const recentFeatures: ReturnType<typeof extractAudioFeatures>[] = [];
 
 // Processing state
 let isInitialized = false;
@@ -838,25 +850,30 @@ function runDBSCANClustering(): ClusterStats | null {
   }
   
   // Run DBSCAN with current (possibly auto-tuned) epsilon
-  const dbscan = new DBSCAN({
+  const result = DBSCAN({
+    dataset: points,
     epsilon: dbscanEpsilon,
-    minPoints: 5,
+    minimumPoints: 5,
     distanceFunction: euclideanDistance
   });
   
-  const labels = dbscan.fit(points);
+  // Convert cluster result to labels array
+  const labels = new Array(points.length).fill(-1);
+  result.clusters.forEach((cluster: number[], clusterId: number) => {
+    for (const idx of cluster) {
+      labels[idx] = clusterId;
+    }
+  });
   
   // Calculate cluster statistics
   const clusterMap = new Map<number, number[]>();
-  let noiseCount = 0;
+  let noiseCount = result.noise.length;
   
   for (let i = 0; i < labels.length; i++) {
     const label = labels[i];
     clusterLabels[i] = label;
     
-    if (label === -1) {
-      noiseCount++;
-    } else {
+    if (label !== -1) {
       if (!clusterMap.has(label)) {
         clusterMap.set(label, []);
       }
@@ -876,9 +893,9 @@ function runDBSCANClustering(): ClusterStats | null {
   clusterMap.forEach((indices, clusterId) => {
     let sumX = 0, sumY = 0, sumZ = 0;
     for (const idx of indices) {
-      sumX += positions[idx * 3];
-      sumY += positions[idx * 3 + 1];
-      sumZ += positions[idx * 3 + 2];
+      sumX += positions![idx * 3];
+      sumY += positions![idx * 3 + 1];
+      sumZ += positions![idx * 3 + 2];
     }
     const size = indices.length;
     clusterCentroids.push({
@@ -892,7 +909,7 @@ function runDBSCANClustering(): ClusterStats | null {
   // Sort by size descending
   clusterSizes.sort((a, b) => b.size - a.size);
   
-  // Calculate silhouette score for auto-tuning (simplified version)
+  // Calculate silhouette score for auto-tuning
   const silhouetteScore = calculateSilhouetteScore(points, labels, clusterMap);
   
   // Auto-tune epsilon based on silhouette score
@@ -910,7 +927,8 @@ function runDBSCANClustering(): ClusterStats | null {
     numDistinctSounds: clusterMap.size,
     clusterLabels: clusterLabels.slice(0, currentCount),
     clusterSizes,
-    clusterCentroids
+    clusterCentroids,
+    silhouetteScore
   };
   
   console.log(`[Worker] DBSCAN: ${clusterMap.size} clusters, ${noiseCount} noise, ε=${dbscanEpsilon.toFixed(2)}, silhouette=${silhouetteScore.toFixed(2)}, ${elapsed.toFixed(1)}ms`);
@@ -1131,7 +1149,7 @@ function processAudio(): void {
     }
     
     // Notify about new cluster periodically for camera animation
-    if (currentCount % 30 === 0 && currentCount > UMAP_BATCH_SIZE) {
+    if (currentCount % 30 === 0 && currentCount > CONFIG.UMAP_INITIAL_BATCH) {
       postMessage({
         type: 'newCluster',
         position: { x: pos[0], y: pos[1], z: pos[2] },
@@ -1183,7 +1201,8 @@ function startProcessing(): void {
             numDistinctSounds: stats.numDistinctSounds,
             clusterLabels: stats.clusterLabels,
             clusterSizes: stats.clusterSizes,
-            clusterCentroids: stats.clusterCentroids
+            clusterCentroids: stats.clusterCentroids,
+            silhouetteScore: stats.silhouetteScore
           });
         }
       } catch (e) {
@@ -1212,13 +1231,6 @@ function stopProcessing(): void {
     clusterInterval = null;
   }
 }
-
-// Types for messages
-interface ExportMessage {
-  type: 'export';
-}
-
-type WorkerMessage = InitMessage | DisposeMessage | ExportMessage;
 
 /**
  * Handle messages from main thread

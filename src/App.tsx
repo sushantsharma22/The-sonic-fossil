@@ -1,11 +1,14 @@
 /**
  * App.tsx - Sonic Latent Manifold Explorer
  * Apple-style minimalist UI with Glassmorphism
+ * 
+ * ENHANCED: Source separation, real-time spectrogram, silhouette score
  */
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Nebula from './Nebula';
-import { AudioEngine } from './AudioEngine';
+import { AudioEngine, SeparatedSource } from './AudioEngine';
 import { handleExport, exportAsJSON, captureScreenshot, exportAsGLB, getCurrentPositions } from './Exporter';
+import Spectrogram from './Spectrogram';
 import * as THREE from 'three';
 
 type Status = 'idle' | 'initializing' | 'listening' | 'processing' | 'error';
@@ -29,6 +32,13 @@ export default function App() {
   const [numDistinctSounds, setNumDistinctSounds] = useState(0);
   const [clusterSizes, setClusterSizes] = useState<ClusterSize[]>([]);
   const [showCentroids, setShowCentroids] = useState(true);
+  const [silhouetteScore, setSilhouetteScore] = useState(0);
+  
+  // Source separation state
+  const [enableSeparation, setEnableSeparation] = useState(false);
+  const [separatedSources, setSeparatedSources] = useState<SeparatedSource[]>([]);
+  const [showSpectrogram, setShowSpectrogram] = useState(true);
+  const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
   
   // Recording tracking
   const [recordingStartTime, setRecordingStartTime] = useState<number>(0);
@@ -44,6 +54,11 @@ export default function App() {
   if (!audioEngineRef.current) {
     audioEngineRef.current = new AudioEngine({
       onConfidence: setConfidence,
+      onSeparatedSources: (sources) => {
+        setSeparatedSources(sources);
+        console.log(`[App] ${sources.length} sources separated`);
+      },
+      enableSeparation: false, // Start disabled, user can enable
     });
   }
 
@@ -73,10 +88,13 @@ export default function App() {
       
       if (type === 'clusters_updated') {
         // Handle DBSCAN cluster updates
-        const { numDistinctSounds: nds, clusterLabels, clusterSizes: sizes, clusterCentroids } = e.data;
+        const { numDistinctSounds: nds, clusterLabels, clusterSizes: sizes, clusterCentroids, silhouetteScore: score } = e.data;
         
         setNumDistinctSounds(nds);
         setClusterSizes(sizes || []);
+        if (score !== undefined) {
+          setSilhouetteScore(score);
+        }
         
         // Update visualization colors
         const updateClusterColors = (window as any).__nebulaUpdateClusterColors;
@@ -138,6 +156,12 @@ export default function App() {
       setWorkerReady(true); // Trigger worker message listener setup
       setStatus('listening');
       
+      // Get AnalyserNode for spectrogram
+      const analyser = currentAudioEngine.getAnalyserNode();
+      if (analyser) {
+        setAnalyserNode(analyser);
+      }
+      
       // Start recording duration timer
       setRecordingStartTime(Date.now());
       durationIntervalRef.current = window.setInterval(() => {
@@ -191,6 +215,9 @@ export default function App() {
     setRecordingDuration('00:00');
     setNumDistinctSounds(0);
     setClusterSizes([]);
+    setSilhouetteScore(0);
+    setSeparatedSources([]);
+    setAnalyserNode(null);
     
     // Reset Nebula points
     const updatePoints = (window as any).__nebulaUpdatePoints;
@@ -201,8 +228,19 @@ export default function App() {
     // Create new AudioEngine instance for fresh start
     audioEngineRef.current = new AudioEngine({
       onConfidence: setConfidence,
+      onSeparatedSources: (sources) => {
+        setSeparatedSources(sources);
+      },
+      enableSeparation: enableSeparation,
     });
-  }, [isListening]);
+  }, [isListening, enableSeparation]);
+  
+  // Toggle source separation
+  useEffect(() => {
+    if (audioEngineRef.current && isListening) {
+      audioEngineRef.current.setEnableSeparation(enableSeparation);
+    }
+  }, [enableSeparation, isListening]);
 
   // Cleanup
   useEffect(() => {
@@ -241,8 +279,7 @@ export default function App() {
                 <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
                 <span className="text-xs text-white/60 font-light">LIVE</span>
               </div>
-              <span className="text-xs text-cyan/60">|
-              </span>
+              <span className="text-xs text-cyan/60">|</span>
               <span className="text-xs text-cyan/60">
                 {pointCount.toLocaleString()} vectors
               </span>
@@ -251,6 +288,14 @@ export default function App() {
                   <span className="text-xs text-white/30">|</span>
                   <span className="text-xs text-purple-400/80 font-medium">
                     {numDistinctSounds} clusters
+                  </span>
+                </>
+              )}
+              {enableSeparation && separatedSources.length > 0 && (
+                <>
+                  <span className="text-xs text-white/30">|</span>
+                  <span className="text-xs text-orange-400/80 font-medium">
+                    {separatedSources.length} sources
                   </span>
                 </>
               )}
@@ -305,10 +350,35 @@ export default function App() {
               </>
             )}
             <div className="flex justify-between items-center text-[10px]">
+              <span className="text-white/40">Silhouette Score:</span>
+              <span className={`font-mono ${silhouetteScore > 0.5 ? 'text-green-400/80' : silhouetteScore > 0.25 ? 'text-yellow-400/80' : 'text-red-400/80'}`}>
+                {silhouetteScore.toFixed(2)}
+              </span>
+            </div>
+            <div className="flex justify-between items-center text-[10px]">
               <span className="text-white/40">Recording:</span>
               <span className="text-green-400/80 font-mono">{recordingDuration}</span>
             </div>
           </div>
+          
+          {/* Source Separation Info */}
+          {enableSeparation && separatedSources.length > 0 && (
+            <div className="mb-3 pb-3 border-b border-white/10">
+              <div className="text-[10px] text-white/40 uppercase tracking-wider mb-2">Separated Sources</div>
+              <div className="space-y-1.5">
+                {separatedSources.map((source) => (
+                  <div key={source.sourceId} className="flex items-center gap-2 text-[10px]">
+                    <div 
+                      className="w-2 h-2 rounded-full"
+                      style={{ backgroundColor: `hsl(${source.sourceId * 120}, 80%, 60%)` }}
+                    />
+                    <span className="text-white/50">Source {source.sourceId + 1}:</span>
+                    <span className="text-white/70 font-mono">{(source.dominantFrequency).toFixed(0)}Hz</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           
           {/* Cluster Size Bar Chart */}
           {clusterSizes.length > 0 && (
@@ -354,6 +424,27 @@ export default function App() {
           >
             <span className={`w-2 h-2 rounded-full ${showCentroids ? 'bg-green-400' : 'bg-white/20'}`} />
             <span className="text-white/50">Show Cluster Centers</span>
+          </button>
+          
+          {/* Source Separation Toggle */}
+          <button
+            onClick={() => setEnableSeparation(!enableSeparation)}
+            className="mt-2 w-full px-2 py-1.5 text-[10px] rounded-lg border border-orange-500/20
+                       hover:bg-orange-500/10 transition-colors flex items-center justify-center gap-2"
+          >
+            <span className={`w-2 h-2 rounded-full ${enableSeparation ? 'bg-orange-400 animate-pulse' : 'bg-white/20'}`} />
+            <span className="text-white/50">Source Separation {enableSeparation ? 'ON' : 'OFF'}</span>
+            <span className="text-[8px] text-orange-400/60 ml-1">β</span>
+          </button>
+          
+          {/* Spectrogram Toggle */}
+          <button
+            onClick={() => setShowSpectrogram(!showSpectrogram)}
+            className="mt-2 w-full px-2 py-1.5 text-[10px] rounded-lg border border-white/10
+                       hover:bg-white/5 transition-colors flex items-center justify-center gap-2"
+          >
+            <span className={`w-2 h-2 rounded-full ${showSpectrogram ? 'bg-cyan-400' : 'bg-white/20'}`} />
+            <span className="text-white/50">Show Spectrogram</span>
           </button>
         </div>
       )}
@@ -538,8 +629,20 @@ export default function App() {
             <div>🔄 UMAP projects to 3D</div>
             <div>🎯 DBSCAN finds clusters</div>
             <div>🎨 Each color = distinct sound</div>
+            {enableSeparation && (
+              <div className="text-orange-400/60">🔊 Source separation active</div>
+            )}
           </div>
         </div>
+      )}
+      
+      {/* Real-time Spectrogram */}
+      {isListening && showSpectrogram && (
+        <Spectrogram
+          isListening={isListening}
+          analyserNode={analyserNode}
+          dominantCluster={clusterSizes.length > 0 ? clusterSizes[0].id : -1}
+        />
       )}
     </div>
   );
