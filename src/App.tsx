@@ -30,6 +30,11 @@ export default function App() {
   const [clusterSizes, setClusterSizes] = useState<ClusterSize[]>([]);
   const [showCentroids, setShowCentroids] = useState(true);
   
+  // Recording tracking
+  const [recordingStartTime, setRecordingStartTime] = useState<number>(0);
+  const [recordingDuration, setRecordingDuration] = useState<string>('00:00');
+  const durationIntervalRef = useRef<number | null>(null);
+  
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const audioEngineRef = useRef<AudioEngine | null>(null);
@@ -132,12 +137,34 @@ export default function App() {
       setIsListening(true);
       setWorkerReady(true); // Trigger worker message listener setup
       setStatus('listening');
+      
+      // Start recording duration timer
+      setRecordingStartTime(Date.now());
+      durationIntervalRef.current = window.setInterval(() => {
+        const elapsed = Date.now() - Date.now(); // Will be updated in effect
+        const minutes = Math.floor(elapsed / 60000);
+        const seconds = Math.floor((elapsed % 60000) / 1000);
+        setRecordingDuration(`${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`);
+      }, 1000);
     } catch (err) {
       console.error('Failed to initialize:', err);
       setStatus('error');
       setAiStatus(err instanceof Error ? err.message : 'Microphone access denied');
     }
   }, [isListening]);
+  
+  // Update recording duration
+  useEffect(() => {
+    if (isListening && recordingStartTime > 0) {
+      const interval = setInterval(() => {
+        const elapsed = Date.now() - recordingStartTime;
+        const minutes = Math.floor(elapsed / 60000);
+        const seconds = Math.floor((elapsed % 60000) / 1000);
+        setRecordingDuration(`${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`);
+      }, 1000);
+      return () => clearInterval(interval);
+    }
+  }, [isListening, recordingStartTime]);
 
   // Stop listening
   const stopListening = useCallback(() => {
@@ -148,12 +175,22 @@ export default function App() {
       currentAudioEngine.dispose();
     }
     
+    // Clear duration timer
+    if (durationIntervalRef.current) {
+      clearInterval(durationIntervalRef.current);
+      durationIntervalRef.current = null;
+    }
+    
     setIsListening(false);
     setWorkerReady(false);
     setStatus('idle');
     setAiStatus('Stopped - Click to restart');
     setPointCount(0);
     setConfidence(0);
+    setRecordingStartTime(0);
+    setRecordingDuration('00:00');
+    setNumDistinctSounds(0);
+    setClusterSizes([]);
     
     // Reset Nebula points
     const updatePoints = (window as any).__nebulaUpdatePoints;
@@ -198,18 +235,43 @@ export default function App() {
           <div className="text-xs text-white/40 uppercase tracking-wider">
             {aiStatus}
           </div>
-          {pointCount > 0 && (
+          {pointCount > 0 && isListening && (
+            <div className="flex items-center justify-end gap-2 mt-1">
+              <div className="flex items-center gap-1.5">
+                <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                <span className="text-xs text-white/60 font-light">LIVE</span>
+              </div>
+              <span className="text-xs text-cyan/60">|
+              </span>
+              <span className="text-xs text-cyan/60">
+                {pointCount.toLocaleString()} vectors
+              </span>
+              {numDistinctSounds > 0 && (
+                <>
+                  <span className="text-xs text-white/30">|</span>
+                  <span className="text-xs text-purple-400/80 font-medium">
+                    {numDistinctSounds} clusters
+                  </span>
+                </>
+              )}
+              <span className="text-xs text-white/30">|</span>
+              <span className="text-xs text-white/50 font-mono">
+                {recordingDuration}
+              </span>
+            </div>
+          )}
+          {pointCount > 0 && !isListening && (
             <div className="text-xs text-cyan/60 mt-1">
-              {pointCount.toLocaleString()} vectors
+              {pointCount.toLocaleString()} vectors (stopped)
             </div>
           )}
         </div>
       </header>
 
-      {/* Distinct Sounds Counter - Large Display */}
+      {/* Distinct Sounds Counter - Enhanced Display */}
       {isListening && numDistinctSounds > 0 && (
-        <div className="absolute top-24 right-6 z-10 glass rounded-xl p-4 min-w-[200px]">
-          <div className="text-center">
+        <div className="absolute top-24 right-6 z-10 glass rounded-xl p-4 min-w-[240px]">
+          <div className="text-center mb-3">
             <div className="text-5xl font-extralight text-white/90 tracking-tight">
               {numDistinctSounds}
             </div>
@@ -218,11 +280,41 @@ export default function App() {
             </div>
           </div>
           
+          {/* Cluster Quality Metrics */}
+          <div className="mb-3 pb-3 border-b border-white/10 space-y-1.5">
+            <div className="flex justify-between items-center text-[10px]">
+              <span className="text-white/40">Total Vectors:</span>
+              <span className="text-white/70 font-mono">{pointCount.toLocaleString()}</span>
+            </div>
+            {clusterSizes.length > 0 && (
+              <>
+                <div className="flex justify-between items-center text-[10px]">
+                  <span className="text-white/40">Largest Cluster:</span>
+                  <span className="text-white/70 font-mono">{clusterSizes[0].size} pts</span>
+                </div>
+                <div className="flex justify-between items-center text-[10px]">
+                  <span className="text-white/40">Noise Points:</span>
+                  <span className="text-white/70 font-mono">
+                    {(() => {
+                      const noiseCount = pointCount - clusterSizes.reduce((sum, c) => sum + c.size, 0);
+                      const noisePercent = ((noiseCount / pointCount) * 100).toFixed(1);
+                      return `${noiseCount} (${noisePercent}%)`;
+                    })()}
+                  </span>
+                </div>
+              </>
+            )}
+            <div className="flex justify-between items-center text-[10px]">
+              <span className="text-white/40">Recording:</span>
+              <span className="text-green-400/80 font-mono">{recordingDuration}</span>
+            </div>
+          </div>
+          
           {/* Cluster Size Bar Chart */}
           {clusterSizes.length > 0 && (
-            <div className="mt-4 space-y-2">
+            <div className="space-y-2">
               <div className="text-[10px] text-white/40 uppercase tracking-wider">Cluster Distribution</div>
-              {clusterSizes.slice(0, 6).map((cluster, index) => {
+              {clusterSizes.slice(0, 8).map((cluster, index) => {
                 const maxSize = Math.max(...clusterSizes.map(c => c.size));
                 const percentage = (cluster.size / maxSize) * 100;
                 const hue = (cluster.id / Math.max(1, clusterSizes.length)) * 360;

@@ -79,19 +79,31 @@ const featureHistory: AudioFeatureData[] = [];
 // Point data storage
 let currentCount = 0;
 
-// UMAP batch accumulation
+// CONTINUOUS UMAP CONFIGURATION
+const CONFIG = {
+  MAX_FEATURE_VECTORS: 2000,      // Sliding window limit (memory management)
+  UMAP_INITIAL_BATCH: 200,        // First UMAP run (need minimum data)
+  UMAP_UPDATE_INTERVAL: 50,       // Re-project every 50 new vectors
+  UMAP_FULL_REFIT_INTERVAL: 500,  // Full re-fit every 500 for stability
+  MIN_UMAP_GAP_MS: 1000,          // Throttle: max 1 UMAP/second
+  DBSCAN_UPDATE_INTERVAL: 100,    // Re-cluster every 100 vectors
+  DBSCAN_MIN_POINTS: 50,          // Minimum data for clustering
+  EPSILON_AUTO_TUNE_INTERVAL: 200 // Re-compute epsilon every 200 vectors
+};
+
+// UMAP batch accumulation with sliding window
 const featureVectors: number[][] = []; // 20D feature vectors
-const UMAP_BATCH_SIZE = 200; // Minimum vectors needed for UMAP
 let umapModel: UMAP | null = null;
+let umapProjections: number[][] = [];   // Cached UMAP 3D projections
 let lastUmapTime = 0;
-const UMAP_INTERVAL = 2000; // Run UMAP every 2 seconds when batch ready
+let vectorsProcessedSinceLastUmap = 0;
 
 // DBSCAN clustering state
 let clusterLabels: Int32Array = new Int32Array(MAX_POINTS);
 let lastClusterTime = 0;
-const CLUSTER_INTERVAL = 500; // Run DBSCAN every 500ms for performance
-let dbscanEpsilon = 0.3; // Starting epsilon (smaller for UMAP space)
+let dbscanEpsilon = 0.3; // Starting epsilon (auto-tuned)
 let lastClusterStats: ClusterStats | null = null;
+let lastEpsilonTuneCount = 0;
 
 // Processing state
 let isInitialized = false;
@@ -465,45 +477,77 @@ function extract20DFeatureVector(features: ReturnType<typeof extractAudioFeature
 }
 
 /**
- * Run UMAP dimensionality reduction on accumulated feature vectors
- * Projects 20D feature space to 3D visualization space
+ * CONTINUOUS UMAP: Initial fit on first batch
  */
-function runUMAPProjection(): void {
-  if (featureVectors.length < UMAP_BATCH_SIZE) {
-    console.log(`[Worker] UMAP waiting: ${featureVectors.length}/${UMAP_BATCH_SIZE} vectors`);
-    return;
-  }
-  
+function initializeUMAP(): void {
   const startTime = performance.now();
   
-  // Initialize or update UMAP model
-  if (!umapModel) {
-    umapModel = new UMAP({
-      nComponents: 3,
-      nNeighbors: 15,
-      minDist: 0.1,
-      spread: 1.0,
-      random: Math.random
-    });
-  }
+  umapModel = new UMAP({
+    nComponents: 3,
+    nNeighbors: 15,
+    minDist: 0.1,
+    spread: 1.0,
+    random: Math.random
+  });
   
-  // Fit UMAP on all accumulated vectors
-  const projectedPositions = umapModel.fit(featureVectors);
+  // Initial fit on first batch
+  umapProjections = umapModel.fit(featureVectors);
   
-  // Update target positions with UMAP output
-  if (targetPositions) {
-    for (let i = 0; i < Math.min(projectedPositions.length, currentCount); i++) {
-      const idx = i * 3;
-      // Scale UMAP output to fit in our [-4, 4] bounds
-      // UMAP typically outputs in [-5, 15] range, normalize it
-      targetPositions[idx] = Math.max(-4, Math.min(4, (projectedPositions[i][0] - 5) * 0.8));
-      targetPositions[idx + 1] = Math.max(-4, Math.min(4, (projectedPositions[i][1] - 5) * 0.8));
-      targetPositions[idx + 2] = Math.max(-4, Math.min(4, (projectedPositions[i][2] - 5) * 0.8));
-    }
+  const elapsed = performance.now() - startTime;
+  console.log(`[Worker] UMAP INITIALIZED: ${umapProjections.length} vectors in ${elapsed.toFixed(1)}ms`);
+  
+  updatePositionsFromUMAP();
+}
+
+/**
+ * CONTINUOUS UMAP: Incremental updates for streaming data
+ */
+function updateUMAPIncremental(): void {
+  if (!umapModel || featureVectors.length < CONFIG.UMAP_INITIAL_BATCH) return;
+  
+  const startTime = performance.now();
+  const currentVectorCount = featureVectors.length;
+  
+  // CRITICAL: Full re-fit every 500 vectors for stability
+  if (currentVectorCount % CONFIG.UMAP_FULL_REFIT_INTERVAL === 0) {
+    console.log(`[UMAP] Full re-fit at ${currentVectorCount} vectors`);
+    umapProjections = umapModel.fit(featureVectors);
+  } 
+  // Incremental: transform() new vectors only
+  else if (vectorsProcessedSinceLastUmap >= CONFIG.UMAP_UPDATE_INTERVAL) {
+    const newVectorCount = vectorsProcessedSinceLastUmap;
+    const newVectors = featureVectors.slice(-newVectorCount);
+    const newProjections = umapModel.transform(newVectors);
+    
+    // Append new projections
+    umapProjections.push(...newProjections);
+    
+    console.log(`[UMAP] Incremental: +${newVectorCount} vectors (total: ${umapProjections.length})`);
   }
   
   const elapsed = performance.now() - startTime;
-  console.log(`[Worker] UMAP: projected ${projectedPositions.length} vectors in ${elapsed.toFixed(1)}ms`);
+  if (elapsed > 50) {
+    console.warn(`[UMAP] Slow update: ${elapsed.toFixed(1)}ms`);
+  }
+  
+  updatePositionsFromUMAP();
+  vectorsProcessedSinceLastUmap = 0;
+}
+
+/**
+ * Update 3D positions from UMAP projections with smooth animation
+ */
+function updatePositionsFromUMAP(): void {
+  if (!targetPositions || umapProjections.length === 0) return;
+  
+  for (let i = 0; i < umapProjections.length; i++) {
+    const idx = i * 3;
+    // Scale UMAP output to fit in [-4, 4] bounds
+    // UMAP typically outputs in [-5, 15] range, normalize it
+    targetPositions[idx] = Math.max(-4, Math.min(4, (umapProjections[i][0] - 5) * 0.8));
+    targetPositions[idx + 1] = Math.max(-4, Math.min(4, (umapProjections[i][1] - 5) * 0.8));
+    targetPositions[idx + 2] = Math.max(-4, Math.min(4, (umapProjections[i][2] - 5) * 0.8));
+  }
 }
 
 /**
@@ -720,17 +764,60 @@ function computeConfidence(features: ReturnType<typeof extractAudioFeatures>): n
 }
 
 /**
+ * Adaptive epsilon estimation using k-NN distance method
+ * Finds optimal epsilon based on data density
+ */
+function estimateOptimalEpsilon(points: number[][]): number {
+  const k = 4; // Use 4th nearest neighbor
+  const distances: number[] = [];
+  
+  // Sample 200 random points for efficiency
+  const sampleSize = Math.min(200, points.length);
+  const sampleIndices = new Set<number>();
+  
+  while (sampleIndices.size < sampleSize) {
+    sampleIndices.add(Math.floor(Math.random() * points.length));
+  }
+  
+  // Find k-th nearest distance for each sample
+  for (const idx of sampleIndices) {
+    const point = points[idx];
+    const dists: number[] = [];
+    
+    for (let j = 0; j < points.length; j++) {
+      if (j === idx) continue;
+      const d = euclideanDistance(point, points[j]);
+      dists.push(d);
+    }
+    
+    dists.sort((a, b) => a - b);
+    if (dists.length >= k) {
+      distances.push(dists[k - 1]); // k-th nearest (0-indexed)
+    }
+  }
+  
+  if (distances.length === 0) return 0.3;
+  
+  // Epsilon = 75th percentile of k-NN distances
+  distances.sort((a, b) => a - b);
+  const epsilon = distances[Math.floor(distances.length * 0.75)];
+  
+  // Clamp to reasonable range
+  return Math.max(0.2, Math.min(1.5, epsilon));
+}
+
+/**
  * DBSCAN Clustering for Unsupervised Sound Source Counting
  * 
- * Runs on 3D positions to identify distinct sound clusters without classification.
- * Uses silhouette score to auto-tune epsilon parameter.
+ * Runs on 3D UMAP positions to identify distinct sound clusters.
+ * Auto-tunes epsilon based on data density.
  */
 function runDBSCANClustering(): ClusterStats | null {
-  if (currentCount < 10 || !positions) return null;
+  if (currentCount < CONFIG.DBSCAN_MIN_POINTS || !positions) return null;
   
   const startTime = performance.now();
   
-  // Prepare data points as array of [x, y, z]
+  // Prepare data points as array of [x, y, z] from UMAP projections
   const points: number[][] = [];
   for (let i = 0; i < currentCount; i++) {
     points.push([
@@ -740,7 +827,17 @@ function runDBSCANClustering(): ClusterStats | null {
     ]);
   }
   
-  // Run DBSCAN with current epsilon
+  // ADAPTIVE EPSILON: Recompute periodically based on data density
+  if (currentCount - lastEpsilonTuneCount >= CONFIG.EPSILON_AUTO_TUNE_INTERVAL) {
+    const newEpsilon = estimateOptimalEpsilon(points);
+    if (Math.abs(newEpsilon - dbscanEpsilon) > 0.05) {
+      console.log(`[DBSCAN] Epsilon auto-tuned: ${dbscanEpsilon.toFixed(3)} → ${newEpsilon.toFixed(3)}`);
+      dbscanEpsilon = newEpsilon;
+    }
+    lastEpsilonTuneCount = currentCount;
+  }
+  
+  // Run DBSCAN with current (possibly auto-tuned) epsilon
   const dbscan = new DBSCAN({
     epsilon: dbscanEpsilon,
     minPoints: 5,
@@ -932,20 +1029,48 @@ function processAudio(): void {
   
   // Extract 20D feature vector for UMAP
   const featureVector = extract20DFeatureVector(features);
-  featureVectors.push(featureVector);
   
-  // Add new point
-  if (currentCount < MAX_POINTS && positions && targetPositions) {
+  // SLIDING WINDOW: Drop oldest vectors if buffer full
+  if (featureVectors.length >= CONFIG.MAX_FEATURE_VECTORS) {
+    const dropCount = 100; // Drop in chunks for efficiency
+    featureVectors.splice(0, dropCount);
+    umapProjections.splice(0, dropCount);
+    
+    // Shift point data in buffers
+    if (positions && targetPositions) {
+      for (let i = 0; i < (currentCount - dropCount) * 3; i++) {
+        positions[i] = positions[i + dropCount * 3];
+        targetPositions[i] = targetPositions[i + dropCount * 3];
+      }
+    }
+    
+    // Shift feature history
+    featureHistory.splice(0, dropCount);
+    
+    currentCount -= dropCount;
+    console.log(`[Worker] Sliding window: dropped ${dropCount} oldest vectors (now ${currentCount})`);
+  }
+  
+  featureVectors.push(featureVector);
+  vectorsProcessedSinceLastUmap++;
+  
+  // Add new point (CONTINUOUS - no MAX_POINTS limit due to sliding window)
+  if (positions && targetPositions) {
     const idx = currentCount * 3;
     
     // Initialize position at origin (will be updated by UMAP)
-    if (featureVectors.length < UMAP_BATCH_SIZE) {
+    if (featureVectors.length < CONFIG.UMAP_INITIAL_BATCH) {
       // Before first UMAP run, place points randomly
       targetPositions[idx] = (Math.random() - 0.5) * 2;
       targetPositions[idx + 1] = (Math.random() - 0.5) * 2;
       targetPositions[idx + 2] = (Math.random() - 0.5) * 2;
+    } else if (umapProjections.length > 0) {
+      // Use last known UMAP position as starting point
+      const lastProj = umapProjections[umapProjections.length - 1];
+      targetPositions[idx] = Math.max(-4, Math.min(4, (lastProj[0] - 5) * 0.8));
+      targetPositions[idx + 1] = Math.max(-4, Math.min(4, (lastProj[1] - 5) * 0.8));
+      targetPositions[idx + 2] = Math.max(-4, Math.min(4, (lastProj[2] - 5) * 0.8));
     }
-    // Note: targetPositions will be updated by runUMAPProjection()
     
     // Initialize current position with offset for animation effect
     positions[idx] = targetPositions[idx] + (Math.random() - 0.5) * 1.5;
@@ -981,7 +1106,9 @@ function processAudio(): void {
     featureHistory.push(featureData);
     
     // Log progress (no classification)
-    console.log(`[Worker] #${currentCount} → UMAP batch ${featureVectors.length}/${UMAP_BATCH_SIZE} | Centroid:${features.spectralCentroid.toFixed(0)}Hz Pitch:${features.pitch.toFixed(0)}Hz`);
+    if (currentCount % 50 === 0) {
+      console.log(`[Worker] #${currentCount} vectors | UMAP: ${umapModel ? 'active' : 'waiting'} | Clusters: ${lastClusterStats?.numDistinctSounds || 0}`);
+    }
     
     // Send confidence based on signal strength (no classification)
     const confidence = computeConfidence(features);
@@ -990,10 +1117,17 @@ function processAudio(): void {
       value: confidence
     });
     
-    // Run UMAP when batch is ready
-    if (featureVectors.length >= UMAP_BATCH_SIZE && now - lastUmapTime >= UMAP_INTERVAL) {
+    // CONTINUOUS UMAP: Initialize on first batch
+    if (featureVectors.length === CONFIG.UMAP_INITIAL_BATCH && !umapModel) {
+      initializeUMAP();
       lastUmapTime = now;
-      runUMAPProjection();
+    }
+    // CONTINUOUS UMAP: Incremental updates
+    else if (umapModel && 
+             vectorsProcessedSinceLastUmap >= CONFIG.UMAP_UPDATE_INTERVAL && 
+             now - lastUmapTime >= CONFIG.MIN_UMAP_GAP_MS) {
+      updateUMAPIncremental();
+      lastUmapTime = now;
     }
     
     // Notify about new cluster periodically for camera animation
@@ -1034,23 +1168,11 @@ function startProcessing(): void {
     }
   }, 33);
   
-  // UMAP projection at 0.5Hz (every 2 seconds when batch ready)
-  let umapInterval = setInterval(() => {
-    const now = Date.now();
-    if (featureVectors.length >= UMAP_BATCH_SIZE && now - lastUmapTime >= UMAP_INTERVAL) {
-      lastUmapTime = now;
-      try {
-        runUMAPProjection();
-      } catch (e) {
-        console.error('[Worker] UMAP error:', e);
-      }
-    }
-  }, 500);
-  
-  // DBSCAN clustering at 2Hz (every 500ms for performance)
+  // DBSCAN clustering - adaptive interval based on data size
   clusterInterval = setInterval(() => {
     const now = Date.now();
-    if (now - lastClusterTime >= CLUSTER_INTERVAL && currentCount >= 10) {
+    // Run DBSCAN when we have enough data and enough time has passed
+    if (currentCount >= CONFIG.DBSCAN_MIN_POINTS && currentCount % CONFIG.DBSCAN_UPDATE_INTERVAL < 10) {
       lastClusterTime = now;
       try {
         const stats = runDBSCANClustering();
