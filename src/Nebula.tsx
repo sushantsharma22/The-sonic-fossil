@@ -8,7 +8,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import gsap from 'gsap';
 
 const MAX_POINTS = 50000;
-const POINT_SIZE = 0.015;
+const POINT_SIZE = 0.08; // Larger points for better visibility
 
 // Custom neon glow shader
 const vertexShader = `
@@ -24,7 +24,7 @@ const vertexShader = `
     vIntensity = instanceIntensity;
     vAge = instanceAge;
     
-    vec3 pos = position * ${POINT_SIZE.toFixed(4)} + instancePosition;
+    vec3 pos = position * ${(0.08).toFixed(4)} + instancePosition;
     vec4 worldPos = modelMatrix * vec4(pos, 1.0);
     vWorldPosition = worldPos.xyz;
     
@@ -42,28 +42,32 @@ const fragmentShader = `
   varying vec3 vWorldPosition;
   
   void main() {
-    // Distance-based glow
+    // Distance-based glow - softer edge
     float dist = length(gl_PointCoord - vec2(0.5));
-    float alpha = smoothstep(0.5, 0.0, dist);
+    float alpha = smoothstep(0.5, 0.1, dist);
     
     // Pulsing based on time and intensity
-    float pulse = 0.7 + 0.3 * sin(uTime * 2.0 + vIntensity * 10.0);
+    float pulse = 0.8 + 0.2 * sin(uTime * 2.0 + vIntensity * 10.0);
     
-    // Age-based fade (newer points are brighter)
-    float ageFade = exp(-vAge * 0.5);
+    // Age-based fade (newer points are brighter) - slower fade
+    float ageFade = exp(-vAge * 0.2);
     
-    // Distance fog
+    // Distance fog - less aggressive
     float cameraDist = length(vWorldPosition - uCameraPosition);
-    float fog = exp(-cameraDist * 0.05);
+    float fog = exp(-cameraDist * 0.02);
     
-    // Electric cyan with intensity variation
-    vec3 color = uColor * (0.5 + vIntensity * 0.5) * pulse;
+    // Electric cyan with intensity variation - brighter base
+    vec3 color = uColor * (0.7 + vIntensity * 0.3) * pulse;
     
-    // Add bloom halo
-    float halo = smoothstep(0.5, 0.2, dist) * 0.3;
+    // Add bloom halo - stronger
+    float halo = smoothstep(0.5, 0.1, dist) * 0.5;
     color += uColor * halo;
     
-    gl_FragColor = vec4(color, alpha * ageFade * fog * (0.6 + vIntensity * 0.4));
+    // Higher minimum alpha for visibility
+    float finalAlpha = alpha * ageFade * fog * (0.8 + vIntensity * 0.2);
+    finalAlpha = max(finalAlpha, 0.3); // Minimum visibility
+    
+    gl_FragColor = vec4(color, finalAlpha);
   }
 `;
 
