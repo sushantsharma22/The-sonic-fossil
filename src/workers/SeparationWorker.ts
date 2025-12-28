@@ -40,15 +40,15 @@ interface SeparatedSource {
   spectralCentroid: number;
 }
 
-// Configuration
+// Configuration - Optimized for M3 8GB
 const CONFIG = {
-  FFT_SIZE: 2048,
-  HOP_SIZE: 512,
+  FFT_SIZE: 1024,              // Reduced from 2048 for faster processing
+  HOP_SIZE: 256,               // Proportionally reduced
   MIN_SOURCES: 1,
   MAX_SOURCES: 4,
   ENERGY_THRESHOLD: 0.0005,    // Minimum energy to detect a source
   FREQUENCY_BANDS: 8,          // Number of frequency bands for separation
-  NMF_ITERATIONS: 50,          // NMF convergence iterations
+  NMF_ITERATIONS: 10,          // Reduced from 50 for real-time on M3 8GB
   OVERLAP_THRESHOLD: 0.3,      // Spectral overlap threshold for multi-source detection
 };
 

@@ -87,16 +87,19 @@ const featureHistory: AudioFeatureData[] = [];
 // Point data storage
 let currentCount = 0;
 
-// CONTINUOUS UMAP CONFIGURATION
+// CONTINUOUS UMAP CONFIGURATION - Optimized for M3 8GB
 const CONFIG = {
   MAX_FEATURE_VECTORS: 2000,      // Sliding window limit (memory management)
+  AGGRESSIVE_CLEANUP_AT: 1500,    // Start cleanup earlier for M3 8GB
+  CLEANUP_BATCH_SIZE: 200,        // Drop 200 vectors at a time (was 100)
   UMAP_INITIAL_BATCH: 200,        // First UMAP run (need minimum data)
   UMAP_UPDATE_INTERVAL: 50,       // Re-project every 50 new vectors
   UMAP_FULL_REFIT_INTERVAL: 500,  // Full re-fit every 500 for stability
   MIN_UMAP_GAP_MS: 1000,          // Throttle: max 1 UMAP/second
   DBSCAN_UPDATE_INTERVAL: 100,    // Re-cluster every 100 vectors
   DBSCAN_MIN_POINTS: 50,          // Minimum data for clustering
-  EPSILON_AUTO_TUNE_INTERVAL: 200 // Re-compute epsilon every 200 vectors
+  EPSILON_AUTO_TUNE_INTERVAL: 200,// Re-compute epsilon every 200 vectors
+  PERFORMANCE_MONITOR_INTERVAL: 5000, // Monitor performance every 5s
 };
 
 // UMAP batch accumulation with sliding window
@@ -120,6 +123,12 @@ const recentFeatures: ReturnType<typeof extractAudioFeatures>[] = [];
 // Processing state
 let isInitialized = false;
 let lastProcessTime = 0;
+
+// Performance monitoring
+let lastPerformanceCheck = 0;
+let umapProcessingTimes: number[] = [];
+let dbscanProcessingTimes: number[] = [];
+let droppedFrames = 0;
 
 // Spring physics parameters
 const SPRING_K = 0.12;
@@ -538,8 +547,13 @@ function updateUMAPIncremental(): void {
   }
   
   const elapsed = performance.now() - startTime;
-  if (elapsed > 50) {
-    console.warn(`[UMAP] Slow update: ${elapsed.toFixed(1)}ms`);
+  
+  // Track performance for monitoring
+  umapProcessingTimes.push(elapsed);
+  if (umapProcessingTimes.length > 10) umapProcessingTimes.shift();
+  
+  if (elapsed > 100) {
+    console.warn(`[UMAP] Slow update: ${elapsed.toFixed(1)}ms - consider disabling source separation`);
   }
   
   updatePositionsFromUMAP();
@@ -923,6 +937,10 @@ function runDBSCANClustering(): ClusterStats | null {
   
   const elapsed = performance.now() - startTime;
   
+  // Track performance for monitoring
+  dbscanProcessingTimes.push(elapsed);
+  if (dbscanProcessingTimes.length > 10) dbscanProcessingTimes.shift();
+  
   const stats: ClusterStats = {
     numDistinctSounds: clusterMap.size,
     clusterLabels: clusterLabels.slice(0, currentCount),
@@ -1048,9 +1066,9 @@ function processAudio(): void {
   // Extract 20D feature vector for UMAP
   const featureVector = extract20DFeatureVector(features);
   
-  // SLIDING WINDOW: Drop oldest vectors if buffer full
-  if (featureVectors.length >= CONFIG.MAX_FEATURE_VECTORS) {
-    const dropCount = 100; // Drop in chunks for efficiency
+  // AGGRESSIVE MEMORY CLEANUP: Start earlier and drop more for M3 8GB
+  if (featureVectors.length >= CONFIG.AGGRESSIVE_CLEANUP_AT) {
+    const dropCount = CONFIG.CLEANUP_BATCH_SIZE;
     featureVectors.splice(0, dropCount);
     umapProjections.splice(0, dropCount);
     
@@ -1066,7 +1084,7 @@ function processAudio(): void {
     featureHistory.splice(0, dropCount);
     
     currentCount -= dropCount;
-    console.log(`[Worker] Sliding window: dropped ${dropCount} oldest vectors (now ${currentCount})`);
+    console.log(`[Worker] Aggressive cleanup: dropped ${dropCount} oldest vectors (now ${currentCount})`);
   }
   
   featureVectors.push(featureVector);
@@ -1164,6 +1182,34 @@ let physicsInterval: ReturnType<typeof setInterval> | null = null;
 let clusterInterval: ReturnType<typeof setInterval> | null = null;
 
 /**
+ * Performance monitoring and reporting
+ */
+function reportPerformance(): void {
+  const now = Date.now();
+  if (now - lastPerformanceCheck < CONFIG.PERFORMANCE_MONITOR_INTERVAL) return;
+  lastPerformanceCheck = now;
+  
+  const avgUmap = umapProcessingTimes.length > 0 
+    ? umapProcessingTimes.reduce((a, b) => a + b, 0) / umapProcessingTimes.length 
+    : 0;
+  const avgDbscan = dbscanProcessingTimes.length > 0
+    ? dbscanProcessingTimes.reduce((a, b) => a + b, 0) / dbscanProcessingTimes.length
+    : 0;
+  
+  const memUsage = (featureVectors.length * 20 * 8 + currentCount * 3 * 4) / 1024 / 1024;
+  
+  console.log(`[Performance] Vectors: ${currentCount}, Memory: ${memUsage.toFixed(1)}MB, Avg UMAP: ${avgUmap.toFixed(1)}ms, Avg DBSCAN: ${avgDbscan.toFixed(1)}ms`);
+  
+  // Auto-throttle if performance is degrading
+  if (avgUmap > 200 || avgDbscan > 300) {
+    console.warn(`[Performance] WARNING: Slow processing detected! Consider:`);
+    console.warn(`  1. Disable source separation`);
+    console.warn(`  2. Reduce recording duration`);
+    console.warn(`  3. Close other browser tabs`);
+  }
+}
+
+/**
  * Start processing loops
  */
 function startProcessing(): void {
@@ -1173,8 +1219,10 @@ function startProcessing(): void {
   processInterval = setInterval(() => {
     try {
       processAudio();
+      reportPerformance();
     } catch (e) {
       console.error('[Worker] Process error:', e);
+      droppedFrames++;
     }
   }, 50);
   

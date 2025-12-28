@@ -35,10 +35,11 @@ export default function App() {
   const [silhouetteScore, setSilhouetteScore] = useState(0);
   
   // Source separation state
-  const [enableSeparation, setEnableSeparation] = useState(false);
+  const [enableSeparation, setEnableSeparation] = useState(false); // Default OFF for M3 8GB
   const [separatedSources, setSeparatedSources] = useState<SeparatedSource[]>([]);
   const [showSpectrogram, setShowSpectrogram] = useState(true);
   const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
+  const [showPerformanceWarning, setShowPerformanceWarning] = useState(false);
   
   // Recording tracking
   const [recordingStartTime, setRecordingStartTime] = useState<number>(0);
@@ -241,6 +242,21 @@ export default function App() {
       audioEngineRef.current.setEnableSeparation(enableSeparation);
     }
   }, [enableSeparation, isListening]);
+  
+  // Show performance warning when enabling separation
+  const handleSeparationToggle = () => {
+    if (!enableSeparation) {
+      // Warn user about performance impact
+      const memory = (performance as any).memory;
+      const totalMemory = memory?.jsHeapSizeLimit || 0;
+      
+      if (totalMemory > 0 && totalMemory < 4 * 1024 * 1024 * 1024) {
+        setShowPerformanceWarning(true);
+        setTimeout(() => setShowPerformanceWarning(false), 5000);
+      }
+    }
+    setEnableSeparation(!enableSeparation);
+  };
 
   // Cleanup
   useEffect(() => {
@@ -257,6 +273,28 @@ export default function App() {
     <div className="relative w-full h-screen bg-deep overflow-hidden">
       {/* 3D Canvas */}
       <Nebula onCameraRef={handleCameraRef} />
+      
+      {/* Performance Warning Banner */}
+      {showPerformanceWarning && (
+        <div className="absolute top-20 left-1/2 transform -translate-x-1/2 z-30 
+                        glass rounded-xl px-4 py-3 border border-orange-500/30 max-w-md">
+          <div className="flex items-start gap-3">
+            <span className="text-orange-400 text-xl">⚠️</span>
+            <div className="flex-1">
+              <div className="text-orange-400 font-medium text-sm mb-1">Performance Warning</div>
+              <div className="text-white/70 text-xs leading-relaxed">
+                Source separation is compute-intensive. On M3 8GB systems, this may cause:
+                <ul className="mt-1 ml-4 list-disc text-white/50">
+                  <li>Slower processing (3-5 seconds per chunk)</li>
+                  <li>Memory pressure (~1-2GB)</li>
+                  <li>Reduced frame rate</li>
+                </ul>
+                <div className="mt-2 text-orange-400/80">Recommended: Keep OFF unless needed</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Header */}
       <header className="absolute top-0 left-0 right-0 p-6 flex justify-between items-start z-10">
@@ -428,7 +466,7 @@ export default function App() {
           
           {/* Source Separation Toggle */}
           <button
-            onClick={() => setEnableSeparation(!enableSeparation)}
+            onClick={handleSeparationToggle}
             className="mt-2 w-full px-2 py-1.5 text-[10px] rounded-lg border border-orange-500/20
                        hover:bg-orange-500/10 transition-colors flex items-center justify-center gap-2"
           >
