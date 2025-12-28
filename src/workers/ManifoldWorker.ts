@@ -93,9 +93,11 @@ const CONFIG = {
   AGGRESSIVE_CLEANUP_AT: 1500,    // Start cleanup earlier for M3 8GB
   CLEANUP_BATCH_SIZE: 200,        // Drop 200 vectors at a time (was 100)
   UMAP_INITIAL_BATCH: 200,        // First UMAP run (need minimum data)
-  UMAP_UPDATE_INTERVAL: 50,       // Re-project every 50 new vectors
+  UMAP_UPDATE_INTERVAL_SMALL: 50,  // < 500 vectors: update every 50
+  UMAP_UPDATE_INTERVAL_MED: 100,   // 500-1000 vectors: update every 100
+  UMAP_UPDATE_INTERVAL_LARGE: 200, // > 1000 vectors: update every 200
   UMAP_FULL_REFIT_INTERVAL: 500,  // Full re-fit every 500 for stability
-  MIN_UMAP_GAP_MS: 1000,          // Throttle: max 1 UMAP/second
+  MIN_UMAP_GAP_MS: 2000,          // Throttle: max 1 UMAP/2 seconds (increased from 1s)
   DBSCAN_UPDATE_INTERVAL: 100,    // Re-cluster every 100 vectors
   DBSCAN_MIN_POINTS: 50,          // Minimum data for clustering
   EPSILON_AUTO_TUNE_INTERVAL: 200,// Re-compute epsilon every 200 vectors
@@ -521,29 +523,32 @@ function initializeUMAP(): void {
 }
 
 /**
- * CONTINUOUS UMAP: Incremental updates for streaming data
+ * Calculate dynamic UMAP update interval based on vector count
+ * Prevents lag as data grows
+ */
+function getDynamicUpdateInterval(): number {
+  const count = featureVectors.length;
+  if (count < 500) return CONFIG.UMAP_UPDATE_INTERVAL_SMALL;  // 50 vectors
+  if (count < 1000) return CONFIG.UMAP_UPDATE_INTERVAL_MED;   // 100 vectors
+  return CONFIG.UMAP_UPDATE_INTERVAL_LARGE;                  // 200 vectors
+}
+
+/**
+ * CONTINUOUS UMAP: Always uses fit() since transform() is unsupported in umap-js
+ * Adaptive update intervals prevent lag on M3 8GB
  */
 function updateUMAPIncremental(): void {
   if (!umapModel || featureVectors.length < CONFIG.UMAP_INITIAL_BATCH) return;
   
   const startTime = performance.now();
   const currentVectorCount = featureVectors.length;
+  const dynamicInterval = getDynamicUpdateInterval();
   
-  // CRITICAL: Full re-fit every 500 vectors for stability
-  if (currentVectorCount % CONFIG.UMAP_FULL_REFIT_INTERVAL === 0) {
-    console.log(`[UMAP] Full re-fit at ${currentVectorCount} vectors`);
+  // ALWAYS use fit() - transform() is not supported in umap-js
+  // Check if enough new vectors have arrived
+  if (vectorsProcessedSinceLastUmap >= dynamicInterval) {
+    console.log(`[UMAP] Full fit at ${currentVectorCount} vectors (dynamic interval: ${dynamicInterval})`);
     umapProjections = umapModel.fit(featureVectors);
-  } 
-  // Incremental: transform() new vectors only
-  else if (vectorsProcessedSinceLastUmap >= CONFIG.UMAP_UPDATE_INTERVAL) {
-    const newVectorCount = vectorsProcessedSinceLastUmap;
-    const newVectors = featureVectors.slice(-newVectorCount);
-    const newProjections = umapModel.transform(newVectors);
-    
-    // Append new projections
-    umapProjections.push(...newProjections);
-    
-    console.log(`[UMAP] Incremental: +${newVectorCount} vectors (total: ${umapProjections.length})`);
   }
   
   const elapsed = performance.now() - startTime;
@@ -552,8 +557,11 @@ function updateUMAPIncremental(): void {
   umapProcessingTimes.push(elapsed);
   if (umapProcessingTimes.length > 10) umapProcessingTimes.shift();
   
-  if (elapsed > 100) {
-    console.warn(`[UMAP] Slow update: ${elapsed.toFixed(1)}ms - consider disabling source separation`);
+  // Performance warnings for M3 8GB
+  if (elapsed > 2000) {
+    console.error(`[UMAP] CRITICAL: ${elapsed.toFixed(0)}ms - consider disabling source separation on M3 8GB`);
+  } else if (elapsed > 1000) {
+    console.warn(`[UMAP] Slow update: ${elapsed.toFixed(1)}ms`);
   }
   
   updatePositionsFromUMAP();
@@ -1158,12 +1166,15 @@ function processAudio(): void {
       initializeUMAP();
       lastUmapTime = now;
     }
-    // CONTINUOUS UMAP: Incremental updates
+    // CONTINUOUS UMAP: Incremental updates with adaptive intervals
+    // Skip if previous run not finished (now - lastUmapTime should be > 0 after processing)
     else if (umapModel && 
-             vectorsProcessedSinceLastUmap >= CONFIG.UMAP_UPDATE_INTERVAL && 
              now - lastUmapTime >= CONFIG.MIN_UMAP_GAP_MS) {
-      updateUMAPIncremental();
-      lastUmapTime = now;
+      const dynamicInterval = getDynamicUpdateInterval();
+      if (vectorsProcessedSinceLastUmap >= dynamicInterval) {
+        updateUMAPIncremental();
+        lastUmapTime = now;
+      }
     }
     
     // Notify about new cluster periodically for camera animation
