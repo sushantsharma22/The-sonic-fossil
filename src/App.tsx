@@ -23,8 +23,6 @@ export default function App() {
   const [aiStatus, setAiStatus] = useState('Click to start');
   const [isListening, setIsListening] = useState(false);
   const [workerReady, setWorkerReady] = useState(false);
-  const [currentClass, setCurrentClass] = useState('');
-  const [currentPitch, setCurrentPitch] = useState(0);
   const [exportData, setExportData] = useState<any>(null);
   
   // Cluster state
@@ -53,7 +51,7 @@ export default function App() {
     if (!worker) return;
 
     const handleWorkerMessage = (e: MessageEvent) => {
-      const { type, count, message, position, classification, pitch, centroid } = e.data;
+      const { type, count, message, position } = e.data;
       
       console.log('[App] Worker message:', type, { count, message });
       
@@ -85,12 +83,6 @@ export default function App() {
       
       if (type === 'confidence') {
         setConfidence(e.data.value || 0);
-        if (classification) {
-          setCurrentClass(classification);
-        }
-        if (pitch) {
-          setCurrentPitch(pitch);
-        }
       }
       
       if (type === 'status') {
@@ -209,11 +201,6 @@ export default function App() {
           {pointCount > 0 && (
             <div className="text-xs text-cyan/60 mt-1">
               {pointCount.toLocaleString()} vectors
-            </div>
-          )}
-          {currentClass && isListening && (
-            <div className="text-xs text-orange-400/80 mt-1 capitalize">
-              {currentClass.replace(/_/g, ' ')} {currentPitch > 0 && `(${currentPitch.toFixed(0)}Hz)`}
             </div>
           )}
         </div>
@@ -438,30 +425,27 @@ export default function App() {
       {/* Axis Legend - bottom left */}
       {isListening && (
         <div className="absolute bottom-32 left-6 z-10 glass rounded-lg p-3 text-xs">
-          <div className="text-white/60 font-medium mb-2 uppercase tracking-wider text-[10px]">3D Sound Space</div>
+          <div className="text-white/60 font-medium mb-2 uppercase tracking-wider text-[10px]">UMAP Projection Space</div>
           <div className="space-y-1.5">
             <div className="flex items-center gap-2">
               <div className="w-3 h-0.5 bg-red-500"></div>
-              <span className="text-white/50">X: Frequency</span>
-              <span className="text-white/30 text-[10px]">Bass ← → Treble</span>
+              <span className="text-white/50">X: UMAP-1</span>
             </div>
             <div className="flex items-center gap-2">
               <div className="w-3 h-0.5 bg-green-500"></div>
-              <span className="text-white/50">Y: Tonality</span>
-              <span className="text-white/30 text-[10px]">Noisy ↓ ↑ Tonal</span>
+              <span className="text-white/50">Y: UMAP-2</span>
             </div>
             <div className="flex items-center gap-2">
               <div className="w-3 h-0.5 bg-blue-500"></div>
-              <span className="text-white/50">Z: Change</span>
-              <span className="text-white/30 text-[10px]">Steady ← → Varying</span>
+              <span className="text-white/50">Z: UMAP-3</span>
             </div>
           </div>
           <div className="mt-3 pt-2 border-t border-white/10 text-[10px] text-white/30">
-            <div className="font-medium text-white/40 mb-1">Expected Clusters:</div>
-            <div>🐦 High birds: +X +Y +Z</div>
-            <div>🦉 Owls: -X +Y -Z</div>
-            <div>👤 Speech: mid X, +Y, +Z</div>
-            <div>💨 Noise: spread X, -Y</div>
+            <div className="font-medium text-white/40 mb-1">Unsupervised Clustering:</div>
+            <div>📊 20D acoustic features</div>
+            <div>🔄 UMAP projects to 3D</div>
+            <div>🎯 DBSCAN finds clusters</div>
+            <div>🎨 Each color = distinct sound</div>
           </div>
         </div>
       )}

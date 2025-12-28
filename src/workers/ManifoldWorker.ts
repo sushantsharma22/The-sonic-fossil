@@ -3,13 +3,18 @@
  * 
  * Advanced bioacoustic analysis approach:
  * - FFT-based spectral analysis
- * - MFCC (Mel-Frequency Cepstral Coefficients) for species differentiation
+ * - MFCC (Mel-Frequency Cepstral Coefficients) for acoustic fingerprinting
  * - Pitch detection for harmonic analysis
- * - Multi-dimensional feature space projected to 3D
+ * - UMAP dimensionality reduction: 20D features → 3D visualization space
  * - DBSCAN clustering for unsupervised source counting
+ * 
+ * FULLY UNSUPERVISED APPROACH:
+ * No predefined categories or species labels. UMAP discovers natural structure
+ * in 20-dimensional acoustic feature space, DBSCAN identifies distinct clusters.
  */
 
 import DBSCAN from '@cdxoo/dbscan';
+import { UMAP } from 'umap-js';
 
 // Types
 interface InitMessage {
@@ -27,7 +32,8 @@ type WorkerMessage = InitMessage | DisposeMessage;
 // Audio feature data sent to main thread for export
 interface AudioFeatureData {
   timestamp: number;
-  position: [number, number, number];
+  position: [number, number, number];  // UMAP 3D projection
+  rawFeatures: number[];  // Full 20D feature vector for UMAP
   features: {
     rms: number;
     spectralCentroid: number;
@@ -40,12 +46,9 @@ interface AudioFeatureData {
     lowEnergy: number;
     midEnergy: number;
     highEnergy: number;
+    veryHighEnergy: number;
   };
-  classification: {
-    category: string;  // 'bird_high', 'bird_low', 'human', 'ambient', etc.
-    confidence: number;
-  };
-  clusterId?: number; // DBSCAN cluster assignment (-1 = noise)
+  clusterId: number; // DBSCAN cluster assignment (-1 = noise)
 }
 
 // Cluster statistics interface
@@ -76,11 +79,18 @@ const featureHistory: AudioFeatureData[] = [];
 // Point data storage
 let currentCount = 0;
 
+// UMAP batch accumulation
+const featureVectors: number[][] = []; // 20D feature vectors
+const UMAP_BATCH_SIZE = 200; // Minimum vectors needed for UMAP
+let umapModel: UMAP | null = null;
+let lastUmapTime = 0;
+const UMAP_INTERVAL = 2000; // Run UMAP every 2 seconds when batch ready
+
 // DBSCAN clustering state
 let clusterLabels: Int32Array = new Int32Array(MAX_POINTS);
 let lastClusterTime = 0;
 const CLUSTER_INTERVAL = 500; // Run DBSCAN every 500ms for performance
-let dbscanEpsilon = 0.4; // Starting epsilon, will auto-tune
+let dbscanEpsilon = 0.3; // Starting epsilon (smaller for UMAP space)
 let lastClusterStats: ClusterStats | null = null;
 
 // Processing state
@@ -435,10 +445,73 @@ function computeMFCC(spectrum: Float32Array, sr: number, fftSize: number, numCoe
 }
 
 /**
- * Classify sound based on features
- * Returns category and confidence
+ * Extract 20D feature vector for UMAP
+ * Combines all meaningful acoustic features into single vector
  */
-function classifySound(features: ReturnType<typeof extractAudioFeatures>): { category: string; confidence: number } {
+function extract20DFeatureVector(features: ReturnType<typeof extractAudioFeatures>): number[] {
+  return [
+    features.spectralCentroid,
+    features.spectralSpread,
+    features.spectralRolloff,
+    features.zeroCrossingRate,
+    features.spectralFlatness,
+    features.pitch,
+    features.lowEnergy,
+    features.midEnergy,
+    features.highEnergy,
+    features.veryHighEnergy,
+    ...features.mfcc  // 13 MFCC coefficients
+  ];
+}
+
+/**
+ * Run UMAP dimensionality reduction on accumulated feature vectors
+ * Projects 20D feature space to 3D visualization space
+ */
+function runUMAPProjection(): void {
+  if (featureVectors.length < UMAP_BATCH_SIZE) {
+    console.log(`[Worker] UMAP waiting: ${featureVectors.length}/${UMAP_BATCH_SIZE} vectors`);
+    return;
+  }
+  
+  const startTime = performance.now();
+  
+  // Initialize or update UMAP model
+  if (!umapModel) {
+    umapModel = new UMAP({
+      nComponents: 3,
+      nNeighbors: 15,
+      minDist: 0.1,
+      spread: 1.0,
+      random: Math.random
+    });
+  }
+  
+  // Fit UMAP on all accumulated vectors
+  const projectedPositions = umapModel.fit(featureVectors);
+  
+  // Update target positions with UMAP output
+  if (targetPositions) {
+    for (let i = 0; i < Math.min(projectedPositions.length, currentCount); i++) {
+      const idx = i * 3;
+      // Scale UMAP output to fit in our [-4, 4] bounds
+      // UMAP typically outputs in [-5, 15] range, normalize it
+      targetPositions[idx] = Math.max(-4, Math.min(4, (projectedPositions[i][0] - 5) * 0.8));
+      targetPositions[idx + 1] = Math.max(-4, Math.min(4, (projectedPositions[i][1] - 5) * 0.8));
+      targetPositions[idx + 2] = Math.max(-4, Math.min(4, (projectedPositions[i][2] - 5) * 0.8));
+    }
+  }
+  
+  const elapsed = performance.now() - startTime;
+  console.log(`[Worker] UMAP: projected ${projectedPositions.length} vectors in ${elapsed.toFixed(1)}ms`);
+}
+
+/**
+ * REMOVED: classifySound() - No supervised classification in unsupervised clustering
+ * All categorization is done by DBSCAN on UMAP-projected space
+ */
+
+function classifySound_DEPRECATED(features: ReturnType<typeof extractAudioFeatures>): { category: string; confidence: number } {
   const { spectralCentroid, pitch, spectralFlatness, mfcc, lowEnergy, highEnergy, veryHighEnergy, rms } = features;
   
   let category = 'unknown';
@@ -497,10 +570,10 @@ function classifySound(features: ReturnType<typeof extractAudioFeatures>): { cat
   // Adjust confidence by signal strength
   confidence *= Math.min(1, rms * 5 + 0.3);
   
-  return { category, confidence: Math.min(1, confidence) };
+  return { category: 'deprecated', confidence: 0 };
 }
 
-// Running statistics for normalization (adaptive scaling)
+// Running statistics for normalization (DEPRECATED - not used with UMAP)
 const featureStats = {
   pitchMin: 50, pitchMax: 8000,
   centroidMin: 100, centroidMax: 10000,
@@ -510,12 +583,13 @@ const featureStats = {
   zcMin: 0, zcMax: 0.5
 };
 
-// History for temporal features
-const recentFeatures: Array<ReturnType<typeof extractAudioFeatures>> = [];
-const HISTORY_SIZE = 10;
+/**
+ * DEPRECATED: Manual feature mapping removed - replaced by UMAP
+ * featuresToPosition() is no longer used. UMAP handles all dimensionality reduction.
+ */
 
 /**
- * COMPLETELY REWRITTEN: Map audio features to 3D position
+ * OLD FUNCTION - Map audio features to 3D position
  * 
  * The key insight: We need ORTHOGONAL (independent) features for each axis
  * to avoid the straight-line problem.
@@ -615,11 +689,23 @@ function featuresToPosition(features: ReturnType<typeof extractAudioFeatures>): 
   // ═══════════════════════════════════════════════════════════════
   // FINAL BOUNDS CHECK (keep points in visible space)
   // ═══════════════════════════════════════════════════════════════
-  const boundedX = Math.max(-4, Math.min(4, x));
-  const boundedY = Math.max(-4, Math.min(4, y));
-  const boundedZ = Math.max(-4, Math.min(4, z));
-  
-  return [boundedX, boundedY, boundedZ];
+  // DEPRECATED - Replaced by UMAP projection
+  return [0, 0, 0];
+}
+
+/**
+ * Get UMAP position for point index (from targetPositions buffer)
+ */
+function getUMAPPosition(index: number): [number, number, number] {
+  if (!targetPositions || index >= currentCount) {
+    return [0, 0, 0];
+  }
+  const idx = index * 3;
+  return [
+    targetPositions[idx],
+    targetPositions[idx + 1],
+    targetPositions[idx + 2]
+  ];
 }
 
 /**
@@ -715,7 +801,7 @@ function runDBSCANClustering(): ClusterStats | null {
   // Auto-tune epsilon based on silhouette score
   if (silhouetteScore < 0.3 && clusterMap.size > 1) {
     // Poor clustering, try larger epsilon (merge more)
-    dbscanEpsilon = Math.min(1.5, dbscanEpsilon * 1.1);
+    dbscanEpsilon = Math.min(1.2, dbscanEpsilon * 1.1);
   } else if (silhouetteScore > 0.7 && clusterMap.size === 1 && noiseCount > currentCount * 0.3) {
     // Too few clusters with lots of noise, try smaller epsilon
     dbscanEpsilon = Math.max(0.15, dbscanEpsilon * 0.9);
@@ -825,7 +911,7 @@ function applySpringForces(): void {
 }
 
 /**
- * Main processing function
+ * Main processing function - Now uses UMAP for dimensionality reduction
  */
 function processAudio(): void {
   const now = Date.now();
@@ -844,32 +930,38 @@ function processAudio(): void {
   // Extract scientifically meaningful features
   const features = extractAudioFeatures(samples);
   
-  // Compute 3D position based on audio characteristics
-  const pos = featuresToPosition(features);
+  // Extract 20D feature vector for UMAP
+  const featureVector = extract20DFeatureVector(features);
+  featureVectors.push(featureVector);
   
   // Add new point
   if (currentCount < MAX_POINTS && positions && targetPositions) {
     const idx = currentCount * 3;
     
-    // Set target position
-    targetPositions[idx] = pos[0];
-    targetPositions[idx + 1] = pos[1];
-    targetPositions[idx + 2] = pos[2];
+    // Initialize position at origin (will be updated by UMAP)
+    if (featureVectors.length < UMAP_BATCH_SIZE) {
+      // Before first UMAP run, place points randomly
+      targetPositions[idx] = (Math.random() - 0.5) * 2;
+      targetPositions[idx + 1] = (Math.random() - 0.5) * 2;
+      targetPositions[idx + 2] = (Math.random() - 0.5) * 2;
+    }
+    // Note: targetPositions will be updated by runUMAPProjection()
     
     // Initialize current position with offset for animation effect
-    positions[idx] = pos[0] + (Math.random() - 0.5) * 1.5;
-    positions[idx + 1] = pos[1] + (Math.random() - 0.5) * 1.5;
-    positions[idx + 2] = pos[2] + (Math.random() - 0.5) * 1.5;
+    positions[idx] = targetPositions[idx] + (Math.random() - 0.5) * 1.5;
+    positions[idx + 1] = targetPositions[idx + 1] + (Math.random() - 0.5) * 1.5;
+    positions[idx + 2] = targetPositions[idx + 2] + (Math.random() - 0.5) * 1.5;
     
     currentCount++;
     
-    // Classify the sound
-    const classification = classifySound(features);
+    // Get current UMAP position for storage (will be [0,0,0] before first UMAP run)
+    const pos = getUMAPPosition(currentCount - 1);
     
-    // Store feature data for export
+    // Store feature data for export (NO CLASSIFICATION)
     const featureData: AudioFeatureData = {
       timestamp: now,
       position: pos,
+      rawFeatures: featureVector,
       features: {
         rms: features.rms,
         spectralCentroid: features.spectralCentroid,
@@ -881,27 +973,31 @@ function processAudio(): void {
         mfcc: features.mfcc,
         lowEnergy: features.lowEnergy,
         midEnergy: features.midEnergy,
-        highEnergy: features.highEnergy
+        highEnergy: features.highEnergy,
+        veryHighEnergy: features.veryHighEnergy
       },
-      classification
+      clusterId: -1  // Will be assigned by DBSCAN
     };
     featureHistory.push(featureData);
     
-    // Log with classification
-    console.log(`[Worker] #${currentCount} ${classification.category} (${(classification.confidence * 100).toFixed(0)}%) → [${pos[0].toFixed(1)}, ${pos[1].toFixed(1)}, ${pos[2].toFixed(1)}] | Pitch:${features.pitch.toFixed(0)}Hz Centroid:${features.spectralCentroid.toFixed(0)}Hz`);
+    // Log progress (no classification)
+    console.log(`[Worker] #${currentCount} → UMAP batch ${featureVectors.length}/${UMAP_BATCH_SIZE} | Centroid:${features.spectralCentroid.toFixed(0)}Hz Pitch:${features.pitch.toFixed(0)}Hz`);
     
-    // Send confidence and classification
+    // Send confidence based on signal strength (no classification)
     const confidence = computeConfidence(features);
     postMessage({ 
       type: 'confidence', 
-      value: confidence,
-      classification: classification.category,
-      pitch: features.pitch,
-      centroid: features.spectralCentroid
+      value: confidence
     });
     
+    // Run UMAP when batch is ready
+    if (featureVectors.length >= UMAP_BATCH_SIZE && now - lastUmapTime >= UMAP_INTERVAL) {
+      lastUmapTime = now;
+      runUMAPProjection();
+    }
+    
     // Notify about new cluster periodically for camera animation
-    if (currentCount % 30 === 0) {
+    if (currentCount % 30 === 0 && currentCount > UMAP_BATCH_SIZE) {
       postMessage({
         type: 'newCluster',
         position: { x: pos[0], y: pos[1], z: pos[2] },
@@ -937,6 +1033,19 @@ function startProcessing(): void {
       postMessage({ type: 'positions', sab: positionsSAB, count: currentCount });
     }
   }, 33);
+  
+  // UMAP projection at 0.5Hz (every 2 seconds when batch ready)
+  let umapInterval = setInterval(() => {
+    const now = Date.now();
+    if (featureVectors.length >= UMAP_BATCH_SIZE && now - lastUmapTime >= UMAP_INTERVAL) {
+      lastUmapTime = now;
+      try {
+        runUMAPProjection();
+      } catch (e) {
+        console.error('[Worker] UMAP error:', e);
+      }
+    }
+  }, 500);
   
   // DBSCAN clustering at 2Hz (every 500ms for performance)
   clusterInterval = setInterval(() => {
@@ -1030,26 +1139,17 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
             totalPoints: currentCount,
             sessionDuration: featureHistory.length > 0 
               ? (featureHistory[featureHistory.length - 1].timestamp - featureHistory[0].timestamp) / 1000 
-              : 0
+              : 0,
+            umapVectors: featureVectors.length,
+            umapProjected: umapModel !== null
           },
           points: featureHistory,
           axisInfo: {
-            x: { label: 'Pitch/Frequency', unit: 'log Hz', range: [-10, 10], description: 'Low pitch → -X, High pitch → +X' },
-            y: { label: 'Harmonic Complexity', unit: 'MFCC variance', range: [-10, 10], description: 'Simple tones → -Y, Complex harmonics → +Y' },
-            z: { label: 'Temporal Texture', unit: 'spectral spread', range: [-10, 10], description: 'Sustained → -Z, Transient/noisy → +Z' }
+            x: { label: 'UMAP Dimension 1', unit: 'normalized', range: [-4, 4], description: 'First UMAP component of 20D acoustic features' },
+            y: { label: 'UMAP Dimension 2', unit: 'normalized', range: [-4, 4], description: 'Second UMAP component of 20D acoustic features' },
+            z: { label: 'UMAP Dimension 3', unit: 'normalized', range: [-4, 4], description: 'Third UMAP component of 20D acoustic features' }
           },
-          categoryLegend: {
-            'bird_songbird': 'High-pitched birds (sparrows, finches)',
-            'bird_owl': 'Low-pitched birds (owls, pigeons)',
-            'bird_other': 'Other bird calls',
-            'human_speech': 'Human voice/speech',
-            'human_other': 'Other human sounds',
-            'animal_large': 'Large animals (low frequency)',
-            'insect': 'Insects (cicadas, crickets)',
-            'ambient_noise': 'Environmental noise',
-            'ambient_machinery': 'Mechanical/urban sounds',
-            'unknown': 'Unclassified sounds'
-          }
+          note: 'Fully unsupervised clustering. No predefined categories. DBSCAN discovers natural acoustic clusters in UMAP-projected space.'
         }
       });
       break;
