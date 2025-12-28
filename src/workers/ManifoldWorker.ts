@@ -481,108 +481,126 @@ function classifySound(features: ReturnType<typeof extractAudioFeatures>): { cat
   return { category, confidence: Math.min(1, confidence) };
 }
 
+// Running statistics for normalization (adaptive scaling)
+const featureStats = {
+  pitchMin: 50, pitchMax: 8000,
+  centroidMin: 100, centroidMax: 10000,
+  flatnessMin: 0, flatnessMax: 1,
+  spreadMin: 0, spreadMax: 3000,
+  mfccMin: -20, mfccMax: 20,
+  zcMin: 0, zcMax: 0.5
+};
+
+// History for temporal features
+const recentFeatures: Array<ReturnType<typeof extractAudioFeatures>> = [];
+const HISTORY_SIZE = 10;
+
 /**
- * Map audio features to 3D position - EXPANDED SPACE for better separation
+ * COMPLETELY REWRITTEN: Map audio features to 3D position
  * 
- * Axes designed for species differentiation:
+ * The key insight: We need ORTHOGONAL (independent) features for each axis
+ * to avoid the straight-line problem.
  * 
- * X axis: PITCH / FREQUENCY CHARACTER (-10 to +10)
- *   - Low-pitched (owls, large animals) → -X
- *   - High-pitched (songbirds, insects) → +X
+ * AXIS DESIGN - Truly Independent Dimensions:
  * 
- * Y axis: HARMONIC COMPLEXITY / TONALITY (-10 to +10)
- *   - Pure tones (whistles, single notes) → -Y
- *   - Complex harmonics (speech, rich calls) → +Y
+ * X axis: SPECTRAL CENTROID (frequency "center of mass")
+ *   - Pure frequency information, independent of amplitude
+ *   - Low rumbles → -X, High chirps → +X
+ *   - Range: 100Hz to 10000Hz mapped to -4 to +4
  * 
- * Z axis: TEMPORAL TEXTURE (-10 to +10)
- *   - Sustained sounds → -Z
- *   - Transient/noisy sounds → +Z
+ * Y axis: SPECTRAL CONTRAST (ratio of peak to average energy)
+ *   - Measures "peakiness" vs "flatness" of spectrum
+ *   - Tonal sounds (clear pitch) → +Y
+ *   - Noisy sounds (flat spectrum) → -Y
+ *   - Independent of WHERE the frequency is (that's X)
  * 
- * This creates CLEAR SEPARATION:
- *   - Songbirds: +X (high), +Y (complex), variable Z → Upper right
- *   - Owls: -X (low), -Y (pure), -Z (sustained) → Lower left back
- *   - Human speech: center X, +Y (very complex), center Z
- *   - Insects: +X (very high), -Y (simple), +Z (buzzy)
- *   - Ambient noise: spread across Z axis
+ * Z axis: TEMPORAL VARIATION (how much the sound changes over time)
+ *   - Computed from history of recent samples
+ *   - Steady drones → -Z
+ *   - Rapidly changing sounds → +Z
+ *   - Independent of frequency (X) and tonality (Y)
+ * 
+ * This creates NATURAL 3D CLUSTERING:
+ *   - Bird chirps: +X (high freq), +Y (tonal), +Z (varying) → upper-right-front
+ *   - Owl hoots: -X (low freq), +Y (tonal), -Z (steady) → lower-left-back
+ *   - Speech: mid X, mid-high Y (harmonic), +Z (varying)
+ *   - White noise: spread X, -Y (flat), mid Z
+ *   - Engine hum: -X (low), -Y (flat), -Z (steady) → lower-left-back
  */
 function featuresToPosition(features: ReturnType<typeof extractAudioFeatures>): [number, number, number] {
-  const { spectralCentroid, pitch, spectralFlatness, spectralSpread, 
-          mfcc, lowEnergy, midEnergy, highEnergy, veryHighEnergy, rms } = features;
-  
-  // === X AXIS: Pitch/Frequency Character ===
-  // Use combination of pitch and spectral centroid
-  // Log scale to spread out the range
-  let x = 0;
-  if (pitch > 0) {
-    // Pitch-based (50Hz to 8000Hz → -8 to +8)
-    x = (Math.log2(Math.max(pitch, 50)) - 5.6) * 2.5;
-  } else {
-    // Fallback to spectral centroid
-    x = (Math.log10(Math.max(spectralCentroid, 100)) - 2.7) * 5;
-  }
-  // Boost from very high frequency content (birds/insects)
-  x += veryHighEnergy * 3;
-  // Low energy pulls left
-  x -= lowEnergy * 2;
-  
-  // === Y AXIS: Harmonic Complexity ===
-  // Use MFCCs to measure harmonic richness
-  // Higher variance = more complex harmonics
-  const mfccEnergy = mfcc.slice(1, 8).reduce((a, b) => a + Math.abs(b), 0) / 7;
-  const mfccVariance = mfcc.slice(1, 6).reduce((a, b, i) => {
-    return a + Math.abs(b - (mfcc[i] || 0));
-  }, 0) / 5;
-  
-  let y = 0;
-  // Tonal (low flatness) sounds go down, noisy go up
-  y = (1 - spectralFlatness) * 5 - 2.5;
-  // MFCC complexity pushes up
-  y += mfccEnergy * 0.5;
-  y += mfccVariance * 0.3;
-  // Loudness slight influence
-  const rmsDb = 20 * Math.log10(Math.max(rms, 1e-6));
-  y += (rmsDb + 40) / 20;
-  
-  // === Z AXIS: Temporal Texture / Spectral Spread ===
-  // Narrow spread = sustained tone → back (-Z)
-  // Wide spread = transient/noise → front (+Z)
-  let z = 0;
-  z = (spectralSpread / 1500 - 1) * 5;
-  // High flatness (noise) pushes forward
-  z += spectralFlatness * 4 - 2;
-  // Mid energy concentration pulls back
-  z -= midEnergy * 2;
-  
-  // === Apply category-based clustering offsets ===
-  // This ensures different species END UP in different regions
-  const classification = classifySound(features);
-  switch (classification.category) {
-    case 'bird_songbird':
-      x += 2; y += 1; // Push to upper right
-      break;
-    case 'bird_owl':
-      x -= 3; y -= 2; z -= 2; // Lower left back
-      break;
-    case 'human_speech':
-      y += 3; // Strong push up (complex harmonics)
-      break;
-    case 'insect':
-      x += 3; y -= 2; z += 2; // Right, lower, front
-      break;
-    case 'animal_large':
-      x -= 3; y += 1; z -= 1; // Left
-      break;
-    case 'ambient_noise':
-      z += 3; // Push to front
-      break;
+  // Store in history for temporal analysis
+  recentFeatures.push(features);
+  if (recentFeatures.length > HISTORY_SIZE) {
+    recentFeatures.shift();
   }
   
-  // === Clamp to expanded visualization bounds ===
-  x = Math.max(-10, Math.min(10, x));
-  y = Math.max(-10, Math.min(10, y));
-  z = Math.max(-10, Math.min(10, z));
+  // ═══════════════════════════════════════════════════════════════
+  // X AXIS: SPECTRAL CENTROID (Pure Frequency Position)
+  // ═══════════════════════════════════════════════════════════════
+  // Log scale because human pitch perception is logarithmic
+  // 100Hz → -4, 1000Hz → 0, 10000Hz → +4
+  const centroidHz = Math.max(100, Math.min(15000, features.spectralCentroid));
+  const x = (Math.log10(centroidHz) - 3) * 4; // log10(1000) = 3 is center
   
-  return [x, y, z];
+  // ═══════════════════════════════════════════════════════════════
+  // Y AXIS: SPECTRAL CONTRAST / TONALITY
+  // ═══════════════════════════════════════════════════════════════
+  // Combines:
+  // 1. Inverse of spectral flatness (flat = noisy = low Y)
+  // 2. Pitch clarity (clear pitch = high Y)
+  // 3. Harmonic structure from MFCCs
+  
+  // Spectral flatness: 0 = pure tone, 1 = white noise
+  // Invert so tonal = high Y
+  const tonality = 1 - features.spectralFlatness;
+  
+  // Pitch confidence: if we detected a clear pitch, that's tonal
+  const pitchClarity = features.pitch > 0 ? 0.3 : 0;
+  
+  // MFCC delta (difference between coefficients indicates harmonic structure)
+  let mfccContrast = 0;
+  for (let i = 1; i < Math.min(6, features.mfcc.length); i++) {
+    mfccContrast += Math.abs(features.mfcc[i] - features.mfcc[i-1]);
+  }
+  mfccContrast = Math.min(1, mfccContrast / 10);
+  
+  const y = (tonality * 0.5 + pitchClarity + mfccContrast * 0.4) * 8 - 4;
+  
+  // ═══════════════════════════════════════════════════════════════
+  // Z AXIS: TEMPORAL VARIATION (Change Over Time)
+  // ═══════════════════════════════════════════════════════════════
+  // This is COMPLETELY INDEPENDENT of frequency and tonality
+  // It measures how much the sound is changing
+  
+  let temporalVariation = 0;
+  if (recentFeatures.length >= 3) {
+    // Compute variance of recent centroids
+    const recentCentroids = recentFeatures.map(f => f.spectralCentroid);
+    const meanCentroid = recentCentroids.reduce((a, b) => a + b, 0) / recentCentroids.length;
+    const centroidVar = recentCentroids.reduce((a, c) => a + Math.pow(c - meanCentroid, 2), 0) / recentCentroids.length;
+    
+    // Compute variance of recent RMS (amplitude changes)
+    const recentRMS = recentFeatures.map(f => f.rms);
+    const meanRMS = recentRMS.reduce((a, b) => a + b, 0) / recentRMS.length;
+    const rmsVar = recentRMS.reduce((a, r) => a + Math.pow(r - meanRMS, 2), 0) / recentRMS.length;
+    
+    // Normalize and combine
+    temporalVariation = Math.sqrt(centroidVar) / 1000 + Math.sqrt(rmsVar) * 10;
+  }
+  
+  // Also use zero-crossing rate variation as indicator of texture changes
+  const zcContrib = features.zeroCrossingRate * 4;
+  
+  const z = Math.min(4, Math.max(-4, temporalVariation * 2 + zcContrib - 2));
+  
+  // ═══════════════════════════════════════════════════════════════
+  // FINAL BOUNDS CHECK (keep points in visible space)
+  // ═══════════════════════════════════════════════════════════════
+  const boundedX = Math.max(-4, Math.min(4, x));
+  const boundedY = Math.max(-4, Math.min(4, y));
+  const boundedZ = Math.max(-4, Math.min(4, z));
+  
+  return [boundedX, boundedY, boundedZ];
 }
 
 /**

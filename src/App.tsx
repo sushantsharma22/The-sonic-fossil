@@ -352,29 +352,30 @@ export default function App() {
       {/* Axis Legend - bottom left */}
       {isListening && (
         <div className="absolute bottom-32 left-6 z-10 glass rounded-lg p-3 text-xs">
-          <div className="text-white/60 font-medium mb-2 uppercase tracking-wider text-[10px]">Axis Guide</div>
+          <div className="text-white/60 font-medium mb-2 uppercase tracking-wider text-[10px]">3D Sound Space</div>
           <div className="space-y-1.5">
             <div className="flex items-center gap-2">
               <div className="w-3 h-0.5 bg-red-500"></div>
-              <span className="text-white/50">X: Pitch</span>
-              <span className="text-white/30 text-[10px]">Low ← → High</span>
+              <span className="text-white/50">X: Frequency</span>
+              <span className="text-white/30 text-[10px]">Bass ← → Treble</span>
             </div>
             <div className="flex items-center gap-2">
               <div className="w-3 h-0.5 bg-green-500"></div>
-              <span className="text-white/50">Y: Complexity</span>
-              <span className="text-white/30 text-[10px]">Simple ↓ ↑ Rich</span>
+              <span className="text-white/50">Y: Tonality</span>
+              <span className="text-white/30 text-[10px]">Noisy ↓ ↑ Tonal</span>
             </div>
             <div className="flex items-center gap-2">
               <div className="w-3 h-0.5 bg-blue-500"></div>
-              <span className="text-white/50">Z: Texture</span>
-              <span className="text-white/30 text-[10px]">Sustained ← → Noisy</span>
+              <span className="text-white/50">Z: Change</span>
+              <span className="text-white/30 text-[10px]">Steady ← → Varying</span>
             </div>
           </div>
           <div className="mt-3 pt-2 border-t border-white/10 text-[10px] text-white/30">
-            <div>🐦 Songbirds: +X, +Y</div>
-            <div>🦉 Owls: -X, -Y, -Z</div>
-            <div>👤 Human: center X, +Y</div>
-            <div>🦗 Insects: +X, -Y, +Z</div>
+            <div className="font-medium text-white/40 mb-1">Expected Clusters:</div>
+            <div>🐦 High birds: +X +Y +Z</div>
+            <div>🦉 Owls: -X +Y -Z</div>
+            <div>👤 Speech: mid X, +Y, +Z</div>
+            <div>💨 Noise: spread X, -Y</div>
           </div>
         </div>
       )}
