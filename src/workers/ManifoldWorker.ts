@@ -66,27 +66,21 @@ async function initExtractor(): Promise<void> {
   postMessage({ type: 'status', message: 'Loading AI model...' });
 
   try {
-    // Try WebGPU first (best performance on Apple Silicon)
-    extractor = await pipeline('feature-extraction', 'Xenova/clap-htsat-unfused', {
-      device: 'webgpu',
-      dtype: 'q4', // 4-bit quantization for memory efficiency
-    });
-    postMessage({ type: 'status', message: 'WebGPU initialized' });
+    // Try loading the model (browser will use best available backend)
+    extractor = await pipeline('feature-extraction', 'Xenova/clap-htsat-unfused');
+    postMessage({ type: 'status', message: 'Model initialized' });
   } catch (e) {
-    console.warn('WebGPU not available, falling back to WASM:', e);
+    console.warn('Failed to load model:', e);
     
     try {
-      // Fallback to WASM
-      extractor = await pipeline('feature-extraction', 'Xenova/clap-htsat-unfused', {
-        device: 'wasm',
-        dtype: 'q4',
-      });
+      // Try again without quantization
+      extractor = await pipeline('feature-extraction', 'Xenova/clap-htsat-unfused');
       
-      // Optimize WASM threading
+      // Optimize threading
       if (env.backends?.onnx?.wasm) {
         env.backends.onnx.wasm.numThreads = Math.min(navigator.hardwareConcurrency || 4, 4);
       }
-      postMessage({ type: 'status', message: 'WASM initialized' });
+      postMessage({ type: 'status', message: 'Model initialized' });
     } catch (e2) {
       console.error('Failed to initialize extractor:', e2);
       postMessage({ type: 'error', message: 'Failed to load AI model' });

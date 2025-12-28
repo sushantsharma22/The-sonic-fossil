@@ -83,7 +83,7 @@ export function exportPointCloudAsSTL(
   if (opts.binary) {
     result = exporter.parse(exportScene, { binary: true }) as DataView;
     downloadBlob(
-      new Blob([result], { type: 'application/octet-stream' }),
+      new Blob([new Uint8Array(result.buffer as ArrayBuffer)], { type: 'application/octet-stream' }),
       `${opts.filename}.stl`
     );
   } else {
@@ -113,7 +113,7 @@ export function exportSceneAsSTL(
   if (opts.binary) {
     const result = exporter.parse(scene, { binary: true }) as DataView;
     downloadBlob(
-      new Blob([result], { type: 'application/octet-stream' }),
+      new Blob([new Uint8Array(result.buffer as ArrayBuffer)], { type: 'application/octet-stream' }),
       `${opts.filename}.stl`
     );
   } else {
@@ -157,7 +157,7 @@ export function exportConvexHullAsSTL(
   const exporter = new STLExporter();
   const result = exporter.parse(scene, { binary: true }) as DataView;
   downloadBlob(
-    new Blob([result], { type: 'application/octet-stream' }),
+    new Blob([new Uint8Array(result.buffer as ArrayBuffer)], { type: 'application/octet-stream' }),
     `${opts.filename}_hull.stl`
   );
 
