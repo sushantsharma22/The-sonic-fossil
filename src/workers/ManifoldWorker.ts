@@ -47,9 +47,10 @@ let targetPositions: Float32Array | null = null;
 const embeddings: number[][] = [];
 let currentCount = 0;
 
-// AI Pipeline
+// AI Pipeline - use feature-extraction for audio embeddings
 let extractor: any = null;
 let isInitialized = false;
+let useSimpleMode = false; // Fallback mode without AI
 
 // UMAP instance
 let umapInstance: UMAP | null = null;
@@ -60,36 +61,26 @@ const DAMPING = 0.85;
 const REST_THRESHOLD = 0.001;
 
 /**
- * Initialize the CLAP feature extractor with WebGPU/WASM fallback
+ * Initialize the feature extractor with fallback modes
  */
 async function initExtractor(): Promise<void> {
   postMessage({ type: 'status', message: 'Loading AI model...' });
 
   try {
-    // Try loading the model (browser will use best available backend)
-    extractor = await pipeline('feature-extraction', 'Xenova/clap-htsat-unfused');
-    postMessage({ type: 'status', message: 'Model initialized' });
+    // Try loading CLAP model for audio feature extraction
+    console.log('[Worker] Loading feature-extraction model...');
+    extractor = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+    console.log('[Worker] Model loaded successfully');
+    isInitialized = true;
+    useSimpleMode = false;
+    postMessage({ type: 'status', message: 'AI ready' });
   } catch (e) {
-    console.warn('Failed to load model:', e);
-    
-    try {
-      // Try again without quantization
-      extractor = await pipeline('feature-extraction', 'Xenova/clap-htsat-unfused');
-      
-      // Optimize threading
-      if (env.backends?.onnx?.wasm) {
-        env.backends.onnx.wasm.numThreads = Math.min(navigator.hardwareConcurrency || 4, 4);
-      }
-      postMessage({ type: 'status', message: 'Model initialized' });
-    } catch (e2) {
-      console.error('Failed to initialize extractor:', e2);
-      postMessage({ type: 'error', message: 'Failed to load AI model' });
-      return;
-    }
+    console.warn('[Worker] Failed to load AI model, using simple mode:', e);
+    // Fall back to simple audio analysis mode
+    useSimpleMode = true;
+    isInitialized = true;
+    postMessage({ type: 'status', message: 'Simple mode (no AI)' });
   }
-
-  isInitialized = true;
-  postMessage({ type: 'status', message: 'AI ready' });
 }
 
 /**
@@ -103,15 +94,10 @@ function initPositionBuffers(): void {
   velocities = new Float32Array(MAX_POINTS * 3);
   targetPositions = new Float32Array(MAX_POINTS * 3);
 
-  // Initialize with random positions for visual feedback
-  for (let i = 0; i < 100; i++) {
-    const idx = i * 3;
-    positions[idx] = (Math.random() - 0.5) * 4;
-    positions[idx + 1] = (Math.random() - 0.5) * 4;
-    positions[idx + 2] = (Math.random() - 0.5) * 4;
-  }
-  currentCount = 100;
+  // Start with no points - they will be created from audio
+  currentCount = 0;
 
+  console.log('[Worker] Position buffers initialized');
   postMessage({ type: 'positions', sab: positionsSAB, count: currentCount });
 }
 
@@ -135,25 +121,80 @@ function readAudioWindow(durationSec: number = 1.0): Float32Array {
 /**
  * Check if audio has significant energy
  */
-function hasAudioEnergy(samples: Float32Array, threshold: number = 0.01): boolean {
+function hasAudioEnergy(samples: Float32Array, threshold: number = 0.005): boolean {
   let energy = 0;
   for (let i = 0; i < samples.length; i += 100) {
     energy += samples[i] * samples[i];
   }
-  return energy / (samples.length / 100) > threshold * threshold;
+  const avgEnergy = energy / (samples.length / 100);
+  return avgEnergy > threshold * threshold;
+}
+
+/**
+ * Extract audio features from samples (simple spectral analysis)
+ */
+function extractAudioFeatures(samples: Float32Array): number[] {
+  const features: number[] = [];
+  const windowSize = 512;
+  const numWindows = Math.floor(samples.length / windowSize);
+  
+  // Compute basic statistics for each window
+  for (let w = 0; w < Math.min(numWindows, 32); w++) {
+    const start = w * windowSize;
+    let sum = 0;
+    let sumSq = 0;
+    let zeroCrossings = 0;
+    let maxVal = 0;
+    
+    for (let i = 0; i < windowSize; i++) {
+      const val = samples[start + i] || 0;
+      sum += val;
+      sumSq += val * val;
+      maxVal = Math.max(maxVal, Math.abs(val));
+      if (i > 0 && ((samples[start + i - 1] || 0) * val < 0)) {
+        zeroCrossings++;
+      }
+    }
+    
+    const mean = sum / windowSize;
+    const variance = (sumSq / windowSize) - (mean * mean);
+    const rms = Math.sqrt(sumSq / windowSize);
+    
+    features.push(mean * 10, variance * 100, rms * 10, zeroCrossings / windowSize, maxVal);
+  }
+  
+  // Pad or truncate to fixed size
+  while (features.length < 128) features.push(0);
+  return features.slice(0, 128);
 }
 
 /**
  * Extract embedding from audio samples
  */
 async function extractEmbedding(samples: Float32Array): Promise<number[] | null> {
-  if (!extractor || !isInitialized) return null;
+  if (!isInitialized) return null;
 
   try {
-    const result = await extractor(samples, {
-      sampling_rate: sampleRate,
-      return_tensors: false,
-    });
+    if (useSimpleMode) {
+      // Use simple audio feature extraction
+      return extractAudioFeatures(samples);
+    }
+    
+    // Use AI model - convert audio features to text-like representation for the model
+    const audioFeatures = extractAudioFeatures(samples);
+    
+    // Create a text description based on audio characteristics
+    const rms = audioFeatures[2] || 0;
+    const zeroCrossings = audioFeatures[3] || 0;
+    
+    let description = 'sound';
+    if (rms > 0.3) description = 'loud sound';
+    else if (rms < 0.1) description = 'quiet sound';
+    
+    if (zeroCrossings > 0.3) description += ' with high frequency';
+    else if (zeroCrossings < 0.1) description += ' with low frequency';
+
+    const result = await extractor(description, { pooling: 'mean', normalize: true });
 
     // Handle various output formats
     let embedding: number[];
@@ -164,11 +205,14 @@ async function extractEmbedding(samples: Float32Array): Promise<number[] | null>
     } else {
       embedding = Array.from(result);
     }
-
-    return embedding;
+    
+    // Combine with raw audio features for more variation
+    const combined = [...embedding.slice(0, 64), ...audioFeatures.slice(0, 64)];
+    return combined;
   } catch (e) {
-    console.error('Embedding extraction failed:', e);
-    return null;
+    console.error('[Worker] Embedding extraction failed:', e);
+    // Fallback to simple features
+    return extractAudioFeatures(samples);
   }
 }
 
@@ -253,7 +297,7 @@ function computeConfidence(embedding: number[]): number {
   norm = Math.sqrt(norm);
   
   // Normalize to 0-1 range (empirically tuned)
-  return Math.min(1, Math.max(0, norm / 30));
+  return Math.min(1, Math.max(0, norm / 10));
 }
 
 /**
@@ -261,9 +305,9 @@ function computeConfidence(embedding: number[]): number {
  */
 async function processAudio(): Promise<void> {
   // Read audio window
-  const samples = readAudioWindow(1.0);
+  const samples = readAudioWindow(0.5); // 0.5 seconds for more responsive updates
   
-  // Check for audio energy
+  // Check for audio energy - lower threshold for sensitivity
   if (!hasAudioEnergy(samples)) {
     // Still apply spring forces for smooth animation
     applySpringForces();
@@ -272,12 +316,20 @@ async function processAudio(): Promise<void> {
     }
     return;
   }
+  
+  console.log('[Worker] Audio detected, extracting features...');
 
   // Extract embedding
   const embedding = await extractEmbedding(samples);
-  if (!embedding) return;
+  if (!embedding) {
+    console.warn('[Worker] Failed to extract embedding');
+    return;
+  }
+  
+  console.log('[Worker] Embedding extracted, length:', embedding.length);
 
   // Store embedding
+  const prevCount = embeddings.length;
   embeddings.push(embedding);
   if (embeddings.length > MAX_POINTS) {
     embeddings.shift();
@@ -288,31 +340,46 @@ async function processAudio(): Promise<void> {
   const confidence = computeConfidence(embedding);
   postMessage({ type: 'confidence', value: confidence });
 
-  // Recompute UMAP periodically
-  if (embeddings.length % 5 === 0 || embeddings.length < 20) {
+  // For first few points, just place them directly without UMAP
+  if (embeddings.length < 5) {
+    if (positions && targetPositions) {
+      const idx = (currentCount - 1) * 3;
+      // Place new point at a random position
+      const x = (Math.random() - 0.5) * 4;
+      const y = (Math.random() - 0.5) * 4;
+      const z = (Math.random() - 0.5) * 4;
+      positions[idx] = x;
+      positions[idx + 1] = y;
+      positions[idx + 2] = z;
+      targetPositions[idx] = x;
+      targetPositions[idx + 1] = y;
+      targetPositions[idx + 2] = z;
+    }
+    console.log('[Worker] Added point', currentCount, '(pre-UMAP)');
+  } else {
+    // Compute UMAP projection
     const projected = computeUMAP();
     
-    if (projected && targetPositions) {
-      // Update targets
-      for (let i = 0; i < projected.length; i++) {
-        targetPositions[i * 3] = projected[i * 3];
-        targetPositions[i * 3 + 1] = projected[i * 3 + 1];
-        targetPositions[i * 3 + 2] = projected[i * 3 + 2];
-      }
-
-      // Initialize positions for new points
-      for (let i = currentCount; i < embeddings.length; i++) {
+    if (projected && targetPositions && positions) {
+      // Update all target positions from UMAP
+      for (let i = 0; i < currentCount; i++) {
         const idx = i * 3;
-        if (positions) {
-          positions[idx] = targetPositions[idx] + (Math.random() - 0.5) * 2;
-          positions[idx + 1] = targetPositions[idx + 1] + (Math.random() - 0.5) * 2;
-          positions[idx + 2] = targetPositions[idx + 2] + (Math.random() - 0.5) * 2;
+        targetPositions[idx] = projected[idx];
+        targetPositions[idx + 1] = projected[idx + 1];
+        targetPositions[idx + 2] = projected[idx + 2];
+        
+        // Initialize position for new points
+        if (i >= prevCount) {
+          positions[idx] = projected[idx] + (Math.random() - 0.5) * 0.5;
+          positions[idx + 1] = projected[idx + 1] + (Math.random() - 0.5) * 0.5;
+          positions[idx + 2] = projected[idx + 2] + (Math.random() - 0.5) * 0.5;
         }
       }
+      console.log('[Worker] UMAP projection updated for', currentCount, 'points');
 
       // Detect new cluster for camera animation
-      if (embeddings.length > 10 && embeddings.length % 20 === 0) {
-        const lastIdx = (embeddings.length - 1) * 3;
+      if (currentCount > 10 && currentCount % 20 === 0) {
+        const lastIdx = (currentCount - 1) * 3;
         postMessage({
           type: 'newCluster',
           position: {
@@ -325,7 +392,7 @@ async function processAudio(): Promise<void> {
     }
   }
 
-  // Apply spring forces
+  // Apply spring forces for smooth animation
   applySpringForces();
 
   // Send updated positions

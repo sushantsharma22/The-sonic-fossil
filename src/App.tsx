@@ -14,20 +14,33 @@ export default function App() {
   const [status, setStatus] = useState<Status>('idle');
   const [confidence, setConfidence] = useState(0);
   const [pointCount, setPointCount] = useState(0);
-  const [aiStatus, setAiStatus] = useState('Initializing...');
+  const [aiStatus, setAiStatus] = useState('Click to start');
   const [isListening, setIsListening] = useState(false);
+  const [workerReady, setWorkerReady] = useState(false);
   
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const audioEngineRef = useRef<AudioEngine | null>(null);
 
-  const audioEngine = useMemo(() => new AudioEngine({
-    onConfidence: setConfidence,
-  }), []);
+  // Create audio engine once
+  if (!audioEngineRef.current) {
+    audioEngineRef.current = new AudioEngine({
+      onConfidence: setConfidence,
+    });
+  }
 
-  // Handle worker messages for positions and status
+  // Handle worker messages - this effect re-runs when workerReady changes
   useEffect(() => {
+    if (!workerReady) return;
+    
+    const currentAudioEngine = audioEngineRef.current;
+    const worker = currentAudioEngine?.worker;
+    if (!worker) return;
+
     const handleWorkerMessage = (e: MessageEvent) => {
       const { type, count, message, position } = e.data;
+      
+      console.log('[App] Worker message:', type, { count, message });
       
       if (type === 'positions' && count !== undefined) {
         setPointCount(count);
@@ -42,7 +55,7 @@ export default function App() {
       
       if (type === 'status') {
         setAiStatus(message);
-        if (message === 'AI ready') {
+        if (message === 'AI ready' || message === 'Simple mode (no AI)') {
           setStatus('listening');
         }
       }
@@ -61,39 +74,67 @@ export default function App() {
       }
     };
 
-    // Get worker reference from audio engine
-    const worker = (audioEngine as any).worker as Worker | undefined;
-    if (worker) {
-      worker.addEventListener('message', handleWorkerMessage);
-      return () => worker.removeEventListener('message', handleWorkerMessage);
-    }
-  }, [audioEngine]);
+    worker.addEventListener('message', handleWorkerMessage);
+    return () => worker.removeEventListener('message', handleWorkerMessage);
+  }, [workerReady]);
 
   // Initialize audio engine
   const startListening = useCallback(async () => {
     if (isListening) return;
     
+    const currentAudioEngine = audioEngineRef.current;
+    if (!currentAudioEngine) return;
+    
     setStatus('initializing');
     setAiStatus('Requesting microphone access...');
     
     try {
-      await audioEngine.init();
-      audioEngine.setWaveformCanvas(waveformCanvasRef.current);
+      await currentAudioEngine.init();
+      currentAudioEngine.setWaveformCanvas(waveformCanvasRef.current);
       setIsListening(true);
+      setWorkerReady(true); // Trigger worker message listener setup
       setStatus('listening');
     } catch (err) {
       console.error('Failed to initialize:', err);
       setStatus('error');
-      setAiStatus('Microphone access denied');
+      setAiStatus(err instanceof Error ? err.message : 'Microphone access denied');
     }
-  }, [audioEngine, isListening]);
+  }, [isListening]);
+
+  // Stop listening
+  const stopListening = useCallback(() => {
+    if (!isListening) return;
+    
+    const currentAudioEngine = audioEngineRef.current;
+    if (currentAudioEngine) {
+      currentAudioEngine.dispose();
+    }
+    
+    setIsListening(false);
+    setWorkerReady(false);
+    setStatus('idle');
+    setAiStatus('Stopped - Click to restart');
+    setPointCount(0);
+    setConfidence(0);
+    
+    // Reset Nebula points
+    const updatePoints = (window as any).__nebulaUpdatePoints;
+    if (updatePoints) {
+      updatePoints(new Float32Array(0), 0);
+    }
+    
+    // Create new AudioEngine instance for fresh start
+    audioEngineRef.current = new AudioEngine({
+      onConfidence: setConfidence,
+    });
+  }, [isListening]);
 
   // Cleanup
   useEffect(() => {
     return () => {
-      audioEngine.dispose();
+      audioEngineRef.current?.dispose();
     };
-  }, [audioEngine]);
+  }, []);
 
   const handleCameraRef = useCallback((camera: THREE.PerspectiveCamera) => {
     cameraRef.current = camera;
@@ -140,6 +181,23 @@ export default function App() {
             <div className="absolute inset-0 rounded-2xl bg-cyan/5 group-hover:bg-cyan/10 transition-colors" />
             <span className="relative text-cyan/90 font-light tracking-wide">
               {status === 'initializing' ? 'Initializing...' : 'Begin Listening'}
+            </span>
+          </button>
+        </div>
+      )}
+
+      {/* Stop Listening Button - shown when listening */}
+      {isListening && (
+        <div className="absolute top-6 left-1/2 transform -translate-x-1/2 z-20">
+          <button
+            onClick={stopListening}
+            className="group relative px-6 py-2 rounded-xl glass border border-red-500/30 
+                       hover:border-red-500/60 transition-all duration-300"
+          >
+            <div className="absolute inset-0 rounded-xl bg-red-500/5 group-hover:bg-red-500/10 transition-colors" />
+            <span className="relative text-red-400/90 font-light tracking-wide text-sm flex items-center gap-2">
+              <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></span>
+              Stop Listening
             </span>
           </button>
         </div>

@@ -159,6 +159,12 @@ export class AudioEngine {
       this.worker?.terminate();
       this.waveformCtx = null;
       this.isInitialized = false;
+      this.worker = undefined;
+      this.ctx = undefined;
+      this.processor = undefined;
+      this.stream = undefined;
+      // Create new ring buffer for next init
+      this.ring = new RingBuffer(1_000_000);
     } catch (e) {
       console.warn('Dispose error:', e);
     }
