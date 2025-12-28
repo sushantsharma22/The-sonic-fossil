@@ -8,7 +8,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import gsap from 'gsap';
 
 const MAX_POINTS = 50000;
-const POINT_SIZE = 0.08; // Larger points for better visibility
+const POINT_SIZE = 0.015; // Small precise points
 
 // Custom neon glow shader
 const vertexShader = `
@@ -24,7 +24,7 @@ const vertexShader = `
     vIntensity = instanceIntensity;
     vAge = instanceAge;
     
-    vec3 pos = position * ${(0.08).toFixed(4)} + instancePosition;
+    vec3 pos = position * ${POINT_SIZE.toFixed(4)} + instancePosition;
     vec4 worldPos = modelMatrix * vec4(pos, 1.0);
     vWorldPosition = worldPos.xyz;
     

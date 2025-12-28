@@ -95,103 +95,264 @@ function hasAudioEnergy(samples: Float32Array): boolean {
 }
 
 /**
- * Extract rich audio features from samples
+ * Simple FFT implementation (Cooley-Tukey radix-2 DIT)
+ * For proper spectral analysis
  */
-function extractAudioFeatures(samples: Float32Array): number[] {
-  const features: number[] = [];
+function fft(real: Float32Array, imag: Float32Array): void {
+  const n = real.length;
   
-  // Overall statistics
-  let sum = 0, sumSq = 0, maxAmp = 0, minAmp = 0;
-  let zeroCrossings = 0;
-  
-  for (let i = 0; i < samples.length; i++) {
-    const val = samples[i];
-    sum += val;
-    sumSq += val * val;
-    maxAmp = Math.max(maxAmp, val);
-    minAmp = Math.min(minAmp, val);
-    if (i > 0 && samples[i-1] * val < 0) zeroCrossings++;
-  }
-  
-  const mean = sum / samples.length;
-  const rms = Math.sqrt(sumSq / samples.length);
-  const zcRate = zeroCrossings / samples.length;
-  const dynamicRange = maxAmp - minAmp;
-  
-  features.push(rms, zcRate, dynamicRange, mean);
-  
-  // Spectral features - split into frequency bands
-  const bands = 16;
-  const bandSize = Math.floor(samples.length / bands);
-  
-  for (let b = 0; b < bands; b++) {
-    let bandEnergy = 0;
-    let bandZC = 0;
-    const start = b * bandSize;
-    
-    for (let i = 0; i < bandSize; i++) {
-      const val = samples[start + i] || 0;
-      bandEnergy += val * val;
-      if (i > 0 && (samples[start + i - 1] || 0) * val < 0) bandZC++;
+  // Bit-reversal permutation
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    while (j & bit) {
+      j ^= bit;
+      bit >>= 1;
     }
+    j ^= bit;
     
-    features.push(Math.sqrt(bandEnergy / bandSize)); // Band RMS
-    features.push(bandZC / bandSize); // Band ZC rate
-  }
-  
-  // Temporal envelope (attack/decay characteristics)
-  const envSegments = 8;
-  const segSize = Math.floor(samples.length / envSegments);
-  for (let s = 0; s < envSegments; s++) {
-    let segEnergy = 0;
-    for (let i = 0; i < segSize; i++) {
-      const val = samples[s * segSize + i] || 0;
-      segEnergy += val * val;
+    if (i < j) {
+      [real[i], real[j]] = [real[j], real[i]];
+      [imag[i], imag[j]] = [imag[j], imag[i]];
     }
-    features.push(Math.sqrt(segEnergy / segSize));
   }
   
-  return features;
+  // Cooley-Tukey FFT
+  for (let len = 2; len <= n; len <<= 1) {
+    const halfLen = len >> 1;
+    const angle = -2 * Math.PI / len;
+    
+    for (let i = 0; i < n; i += len) {
+      for (let j = 0; j < halfLen; j++) {
+        const theta = angle * j;
+        const cos = Math.cos(theta);
+        const sin = Math.sin(theta);
+        
+        const re = real[i + j + halfLen];
+        const im = imag[i + j + halfLen];
+        
+        const tRe = cos * re - sin * im;
+        const tIm = sin * re + cos * im;
+        
+        real[i + j + halfLen] = real[i + j] - tRe;
+        imag[i + j + halfLen] = imag[i + j] - tIm;
+        real[i + j] += tRe;
+        imag[i + j] += tIm;
+      }
+    }
+  }
 }
 
 /**
- * Map features to 3D position
- * This creates natural clustering based on audio characteristics
+ * Compute magnitude spectrum from FFT
  */
-function featuresToPosition(features: number[]): [number, number, number] {
-  const rms = features[0] || 0;
-  const zcRate = features[1] || 0;
-  const dynamicRange = features[2] || 0;
+function computeSpectrum(samples: Float32Array, fftSize: number): Float32Array {
+  // Prepare FFT input with Hann window
+  const real = new Float32Array(fftSize);
+  const imag = new Float32Array(fftSize);
   
-  // X: Based on energy/loudness (quiet left, loud right)
-  let x = (rms * 30 - 0.3) * 5;
-  
-  // Y: Based on pitch approximation via zero crossing rate (low bottom, high top)
-  let y = (zcRate * 15 - 0.3) * 5;
-  
-  // Z: Based on spectral complexity / dynamic range
-  let spectralVariance = 0;
-  for (let i = 4; i < 20 && i < features.length; i++) {
-    spectralVariance += Math.abs(features[i] - rms);
+  const len = Math.min(samples.length, fftSize);
+  for (let i = 0; i < len; i++) {
+    // Hann window to reduce spectral leakage
+    const window = 0.5 * (1 - Math.cos(2 * Math.PI * i / (len - 1)));
+    real[i] = samples[i] * window;
   }
-  let z = (spectralVariance - 0.2) * 4;
   
-  // Add controlled randomness to prevent exact overlapping
-  const jitter = 0.2;
-  x += (Math.random() - 0.5) * jitter;
-  y += (Math.random() - 0.5) * jitter;
-  z += (Math.random() - 0.5) * jitter;
+  fft(real, imag);
   
-  // Clamp to reasonable bounds
-  x = Math.max(-5, Math.min(5, x));
-  y = Math.max(-5, Math.min(5, y));
-  z = Math.max(-5, Math.min(5, z));
+  // Compute magnitude (only need first half due to symmetry)
+  const spectrum = new Float32Array(fftSize / 2);
+  for (let i = 0; i < fftSize / 2; i++) {
+    spectrum[i] = Math.sqrt(real[i] * real[i] + imag[i] * imag[i]) / fftSize;
+  }
+  
+  return spectrum;
+}
+
+/**
+ * Extract scientifically meaningful audio features
+ * Based on established audio analysis techniques
+ */
+function extractAudioFeatures(samples: Float32Array): {
+  rms: number;           // Root Mean Square (loudness)
+  spectralCentroid: number;  // "Brightness" - center of mass of spectrum (Hz)
+  spectralSpread: number;    // Width of the spectrum
+  spectralRolloff: number;   // Frequency below which 85% of energy is contained
+  zeroCrossingRate: number;  // Related to noisiness/pitch
+  spectralFlatness: number;  // Tonality (0=tonal, 1=noise)
+  lowEnergy: number;     // Energy in bass (20-300 Hz)
+  midEnergy: number;     // Energy in mids (300-2000 Hz)  
+  highEnergy: number;    // Energy in highs (2000-8000 Hz)
+} {
+  const n = samples.length;
+  
+  // 1. RMS (Root Mean Square) - Perceived loudness
+  let sumSq = 0;
+  for (let i = 0; i < n; i++) {
+    sumSq += samples[i] * samples[i];
+  }
+  const rms = Math.sqrt(sumSq / n);
+  
+  // 2. Zero Crossing Rate - Indicates noisiness and approximate pitch
+  let zeroCrossings = 0;
+  for (let i = 1; i < n; i++) {
+    if ((samples[i] >= 0) !== (samples[i - 1] >= 0)) {
+      zeroCrossings++;
+    }
+  }
+  const zeroCrossingRate = zeroCrossings / n;
+  
+  // 3. Compute FFT spectrum for spectral features
+  const fftSize = 2048;
+  const spectrum = computeSpectrum(samples, fftSize);
+  const binFreq = sampleRate / fftSize; // Frequency per bin
+  
+  // 4. Spectral Centroid - "Center of mass" of the spectrum
+  // Higher = brighter sound, Lower = darker sound
+  let weightedSum = 0;
+  let totalMag = 0;
+  for (let i = 1; i < spectrum.length; i++) {
+    const freq = i * binFreq;
+    weightedSum += freq * spectrum[i];
+    totalMag += spectrum[i];
+  }
+  const spectralCentroid = totalMag > 0 ? weightedSum / totalMag : 0;
+  
+  // 5. Spectral Spread - Standard deviation around centroid
+  let spreadSum = 0;
+  for (let i = 1; i < spectrum.length; i++) {
+    const freq = i * binFreq;
+    const diff = freq - spectralCentroid;
+    spreadSum += diff * diff * spectrum[i];
+  }
+  const spectralSpread = totalMag > 0 ? Math.sqrt(spreadSum / totalMag) : 0;
+  
+  // 6. Spectral Rolloff - Frequency containing 85% of energy
+  const rolloffThreshold = 0.85;
+  let cumEnergy = 0;
+  const totalEnergy = spectrum.reduce((a, b) => a + b * b, 0);
+  let spectralRolloff = 0;
+  for (let i = 0; i < spectrum.length; i++) {
+    cumEnergy += spectrum[i] * spectrum[i];
+    if (cumEnergy >= rolloffThreshold * totalEnergy) {
+      spectralRolloff = i * binFreq;
+      break;
+    }
+  }
+  
+  // 7. Spectral Flatness - Geometric mean / Arithmetic mean
+  // 0 = pure tone, 1 = white noise
+  let logSum = 0;
+  let sum = 0;
+  let count = 0;
+  for (let i = 1; i < spectrum.length; i++) {
+    if (spectrum[i] > 1e-10) {
+      logSum += Math.log(spectrum[i]);
+      sum += spectrum[i];
+      count++;
+    }
+  }
+  const geometricMean = count > 0 ? Math.exp(logSum / count) : 0;
+  const arithmeticMean = count > 0 ? sum / count : 0;
+  const spectralFlatness = arithmeticMean > 0 ? geometricMean / arithmeticMean : 0;
+  
+  // 8. Band Energies - Energy in different frequency ranges
+  // These correspond to perceptual categories
+  const lowBin = Math.floor(300 / binFreq);      // 0-300 Hz (bass)
+  const midBin = Math.floor(2000 / binFreq);     // 300-2000 Hz (mids)
+  const highBin = Math.floor(8000 / binFreq);    // 2000-8000 Hz (highs)
+  
+  let lowEnergy = 0, midEnergy = 0, highEnergy = 0;
+  for (let i = 0; i < spectrum.length && i < highBin; i++) {
+    const e = spectrum[i] * spectrum[i];
+    if (i < lowBin) lowEnergy += e;
+    else if (i < midBin) midEnergy += e;
+    else highEnergy += e;
+  }
+  
+  // Normalize energies
+  const maxE = Math.max(lowEnergy, midEnergy, highEnergy, 1e-10);
+  lowEnergy = Math.sqrt(lowEnergy) / Math.sqrt(maxE);
+  midEnergy = Math.sqrt(midEnergy) / Math.sqrt(maxE);
+  highEnergy = Math.sqrt(highEnergy) / Math.sqrt(maxE);
+  
+  return {
+    rms,
+    spectralCentroid,
+    spectralSpread,
+    spectralRolloff,
+    zeroCrossingRate,
+    spectralFlatness,
+    lowEnergy,
+    midEnergy,
+    highEnergy
+  };
+}
+
+/**
+ * Map audio features to 3D position using perceptually meaningful axes
+ * 
+ * Scientific basis:
+ * - X axis: Spectral Centroid (brightness/timbre)
+ *   Bird chirps → high X (bright), Low rumbles → low X (dark)
+ * 
+ * - Y axis: Energy/Loudness (RMS)
+ *   Loud sounds → high Y, Quiet sounds → low Y
+ * 
+ * - Z axis: Spectral Flatness (tonality)
+ *   Pure tones → low Z, Noisy sounds → high Z
+ * 
+ * This creates natural clustering:
+ * - Bird songs: High X, Variable Y, Low-Mid Z (bright, tonal)
+ * - Wind/water: Mid X, Low Y, High Z (broadband noise)
+ * - Speech: Mid X, Mid Y, Mid Z (complex harmonic)
+ */
+function featuresToPosition(features: ReturnType<typeof extractAudioFeatures>): [number, number, number] {
+  // Normalize spectral centroid to [-3, 3]
+  // Typical range: 500 Hz (dark) to 5000 Hz (bright)
+  // Bird chirps: 2000-8000 Hz → will be positive X
+  const centroidNorm = Math.log10(Math.max(features.spectralCentroid, 100)) - 3; // log scale
+  let x = centroidNorm * 2.5;
+  
+  // Normalize RMS to [-3, 3]
+  // Use log scale for perceptual loudness (dB-like)
+  const rmsDb = 20 * Math.log10(Math.max(features.rms, 1e-6));
+  // Typical range: -60 dB (very quiet) to 0 dB (max)
+  let y = (rmsDb + 40) / 15; // Maps -60dB→-2.7, -10dB→+2
+  
+  // Spectral flatness to Z axis [-3, 3]
+  // 0 = pure tone, 1 = white noise
+  let z = (features.spectralFlatness - 0.5) * 6;
+  
+  // Secondary modulation based on band energies
+  // High frequency energy pushes slightly up and right
+  x += features.highEnergy * 0.5;
+  y += (features.midEnergy - features.lowEnergy) * 0.3;
+  
+  // Spread affects Z - wide spectrum sounds spread more in Z
+  const spreadNorm = features.spectralSpread / 2000;
+  z += (spreadNorm - 0.5) * 0.5;
+  
+  // Clamp to visualization bounds
+  x = Math.max(-4, Math.min(4, x));
+  y = Math.max(-4, Math.min(4, y));
+  z = Math.max(-4, Math.min(4, z));
   
   return [x, y, z];
 }
 
 /**
- * Apply spring forces to animate points toward targets
+ * Compute confidence based on signal strength and quality
+ */
+function computeConfidence(features: ReturnType<typeof extractAudioFeatures>): number {
+  // Higher confidence for louder, more distinct sounds
+  const rmsConf = Math.min(1, features.rms * 10);
+  // Lower confidence for pure noise
+  const tonalConf = 1 - features.spectralFlatness * 0.5;
+  return Math.min(1, Math.max(0, rmsConf * tonalConf));
+}
+
+/**
+ * Apply spring forces to animate points smoothly toward targets
  */
 function applySpringForces(): void {
   if (!positions || !velocities || !targetPositions) return;
@@ -213,14 +374,6 @@ function applySpringForces(): void {
 }
 
 /**
- * Compute confidence from audio features
- */
-function computeConfidence(features: number[]): number {
-  const rms = features[0] || 0;
-  return Math.min(1, Math.max(0, rms * 8));
-}
-
-/**
  * Main processing function
  */
 function processAudio(): void {
@@ -237,10 +390,10 @@ function processAudio(): void {
   
   lastProcessTime = now;
   
-  // Extract features
+  // Extract scientifically meaningful features
   const features = extractAudioFeatures(samples);
   
-  // Compute 3D position
+  // Compute 3D position based on audio characteristics
   const pos = featuresToPosition(features);
   
   // Add new point
@@ -259,7 +412,8 @@ function processAudio(): void {
     
     currentCount++;
     
-    console.log('[Worker] Point', currentCount, '→', pos.map(p => p.toFixed(2)).join(', '));
+    // Log with scientific context
+    console.log(`[Worker] Point ${currentCount} → X:${pos[0].toFixed(2)} (brightness) Y:${pos[1].toFixed(2)} (loudness) Z:${pos[2].toFixed(2)} (tonality) | Centroid:${features.spectralCentroid.toFixed(0)}Hz RMS:${(features.rms * 100).toFixed(1)}%`);
     
     // Send confidence
     const confidence = computeConfidence(features);
