@@ -1,6 +1,7 @@
 /**
  * Nebula.tsx - High-performance 3D point cloud renderer
  * Uses InstancedMesh with custom shaders for 50,000+ glowing points at 60FPS
+ * Supports cluster-based coloring via DBSCAN labels
  */
 import { useEffect, useRef, useCallback } from 'react';
 import * as THREE from 'three';
@@ -10,19 +11,22 @@ import gsap from 'gsap';
 const MAX_POINTS = 50000;
 const POINT_SIZE = 0.015; // Small precise points
 
-// Custom neon glow shader
+// Custom neon glow shader with per-point color support
 const vertexShader = `
   attribute vec3 instancePosition;
   attribute float instanceIntensity;
   attribute float instanceAge;
+  attribute vec3 instanceColor;
   
   varying float vIntensity;
   varying float vAge;
   varying vec3 vWorldPosition;
+  varying vec3 vColor;
   
   void main() {
     vIntensity = instanceIntensity;
     vAge = instanceAge;
+    vColor = instanceColor;
     
     vec3 pos = position * ${POINT_SIZE.toFixed(4)} + instancePosition;
     vec4 worldPos = modelMatrix * vec4(pos, 1.0);
@@ -33,13 +37,13 @@ const vertexShader = `
 `;
 
 const fragmentShader = `
-  uniform vec3 uColor;
   uniform float uTime;
   uniform vec3 uCameraPosition;
   
   varying float vIntensity;
   varying float vAge;
   varying vec3 vWorldPosition;
+  varying vec3 vColor;
   
   void main() {
     // Distance-based glow - softer edge
@@ -56,12 +60,12 @@ const fragmentShader = `
     float cameraDist = length(vWorldPosition - uCameraPosition);
     float fog = exp(-cameraDist * 0.02);
     
-    // Electric cyan with intensity variation - brighter base
-    vec3 color = uColor * (0.7 + vIntensity * 0.3) * pulse;
+    // Use per-instance color with intensity variation
+    vec3 color = vColor * (0.7 + vIntensity * 0.3) * pulse;
     
     // Add bloom halo - stronger
     float halo = smoothstep(0.5, 0.1, dist) * 0.5;
-    color += uColor * halo;
+    color += vColor * halo;
     
     // Higher minimum alpha for visibility
     float finalAlpha = alpha * ageFade * fog * (0.8 + vIntensity * 0.2);
@@ -70,6 +74,13 @@ const fragmentShader = `
     gl_FragColor = vec4(color, finalAlpha);
   }
 `;
+
+// Cluster centroid sphere interface
+interface ClusterCentroid {
+  x: number;
+  y: number;
+  z: number;
+}
 
 interface NebulaProps {
   onSceneReady?: (scene: THREE.Scene) => void;
@@ -85,12 +96,21 @@ export default function Nebula({ onSceneReady, onCameraRef }: NebulaProps) {
   const controlsRef = useRef<OrbitControls | null>(null);
   const frameIdRef = useRef<number>(0);
   const clockRef = useRef<THREE.Clock>(new THREE.Clock());
+  
+  // Cluster centroid spheres
+  const centroidSpheresRef = useRef<THREE.Mesh[]>([]);
+  const showCentroidsRef = useRef<boolean>(true);
 
   // Buffers for instanced attributes
   const positionsRef = useRef<Float32Array>(new Float32Array(MAX_POINTS * 3));
   const intensitiesRef = useRef<Float32Array>(new Float32Array(MAX_POINTS));
   const agesRef = useRef<Float32Array>(new Float32Array(MAX_POINTS));
+  const colorsRef = useRef<Float32Array>(new Float32Array(MAX_POINTS * 3));
   const pointCountRef = useRef<number>(0);
+  
+  // Cluster state
+  const clusterLabelsRef = useRef<Int32Array>(new Int32Array(MAX_POINTS));
+  const maxClusterIdRef = useRef<number>(0);
 
   // Initialize Three.js scene
   useEffect(() => {
@@ -150,7 +170,6 @@ export default function Nebula({ onSceneReady, onCameraRef }: NebulaProps) {
       vertexShader,
       fragmentShader,
       uniforms: {
-        uColor: { value: new THREE.Color('#00ffff') },
         uTime: { value: 0 },
         uCameraPosition: { value: camera.position },
       },
@@ -164,14 +183,23 @@ export default function Nebula({ onSceneReady, onCameraRef }: NebulaProps) {
     instancedMesh.count = 0;
     instancedMesh.frustumCulled = false;
 
+    // Initialize colors to cyan
+    for (let i = 0; i < MAX_POINTS; i++) {
+      colorsRef.current[i * 3] = 0;     // R
+      colorsRef.current[i * 3 + 1] = 1; // G
+      colorsRef.current[i * 3 + 2] = 1; // B
+    }
+
     // Setup instanced attributes
     const positionAttr = new THREE.InstancedBufferAttribute(positionsRef.current, 3);
     const intensityAttr = new THREE.InstancedBufferAttribute(intensitiesRef.current, 1);
     const ageAttr = new THREE.InstancedBufferAttribute(agesRef.current, 1);
+    const colorAttr = new THREE.InstancedBufferAttribute(colorsRef.current, 3);
 
     geometry.setAttribute('instancePosition', positionAttr);
     geometry.setAttribute('instanceIntensity', intensityAttr);
     geometry.setAttribute('instanceAge', ageAttr);
+    geometry.setAttribute('instanceColor', colorAttr);
 
     scene.add(instancedMesh);
     instancedMeshRef.current = instancedMesh;
@@ -291,6 +319,108 @@ export default function Nebula({ onSceneReady, onCameraRef }: NebulaProps) {
     pointCountRef.current = maxCount;
   }, []);
 
+  // Update cluster colors based on DBSCAN labels
+  const updateClusterColors = useCallback((
+    labels: Int32Array, 
+    centroids: ClusterCentroid[], 
+    maxCluster: number
+  ) => {
+    if (!instancedMeshRef.current) return;
+
+    const mesh = instancedMeshRef.current;
+    const geometry = mesh.geometry;
+    
+    // Store labels and max cluster
+    for (let i = 0; i < labels.length; i++) {
+      clusterLabelsRef.current[i] = labels[i];
+    }
+    maxClusterIdRef.current = maxCluster;
+    
+    // Generate colors for each point based on cluster
+    for (let i = 0; i < pointCountRef.current; i++) {
+      const clusterId = clusterLabelsRef.current[i];
+      
+      if (clusterId === -1) {
+        // Noise points: dark gray
+        colorsRef.current[i * 3] = 0.3;
+        colorsRef.current[i * 3 + 1] = 0.3;
+        colorsRef.current[i * 3 + 2] = 0.3;
+      } else {
+        // Cluster points: HSL color based on cluster ID
+        const hue = (clusterId / Math.max(1, maxCluster + 1)) * 360;
+        const color = new THREE.Color();
+        color.setHSL(hue / 360, 0.9, 0.6);
+        colorsRef.current[i * 3] = color.r;
+        colorsRef.current[i * 3 + 1] = color.g;
+        colorsRef.current[i * 3 + 2] = color.b;
+      }
+    }
+    
+    // Update color buffer
+    const colorAttr = geometry.getAttribute('instanceColor') as THREE.BufferAttribute;
+    colorAttr.needsUpdate = true;
+    
+    // Update centroid spheres
+    updateCentroidSpheres(centroids, maxCluster);
+  }, []);
+  
+  // Update centroid visualization spheres
+  const updateCentroidSpheres = useCallback((centroids: ClusterCentroid[], maxCluster: number) => {
+    if (!sceneRef.current) return;
+    
+    const scene = sceneRef.current;
+    
+    // Remove old spheres
+    for (const sphere of centroidSpheresRef.current) {
+      scene.remove(sphere);
+      sphere.geometry.dispose();
+      (sphere.material as THREE.Material).dispose();
+    }
+    centroidSpheresRef.current = [];
+    
+    if (!showCentroidsRef.current) return;
+    
+    // Create new centroid spheres
+    for (let i = 0; i < centroids.length; i++) {
+      const centroid = centroids[i];
+      const hue = (i / Math.max(1, maxCluster + 1)) * 360;
+      const color = new THREE.Color();
+      color.setHSL(hue / 360, 0.9, 0.6);
+      
+      const sphereGeometry = new THREE.SphereGeometry(0.15, 16, 16);
+      const sphereMaterial = new THREE.MeshBasicMaterial({ 
+        color, 
+        transparent: true, 
+        opacity: 0.7 
+      });
+      const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+      sphere.position.set(centroid.x, centroid.y, centroid.z);
+      
+      // Add glow ring
+      const ringGeometry = new THREE.RingGeometry(0.2, 0.25, 32);
+      const ringMaterial = new THREE.MeshBasicMaterial({ 
+        color, 
+        transparent: true, 
+        opacity: 0.4,
+        side: THREE.DoubleSide
+      });
+      const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+      ring.lookAt(cameraRef.current?.position || new THREE.Vector3(0, 0, 1));
+      sphere.add(ring);
+      
+      scene.add(sphere);
+      centroidSpheresRef.current.push(sphere);
+    }
+  }, []);
+  
+  // Toggle centroid visibility
+  const toggleCentroids = useCallback((show: boolean) => {
+    showCentroidsRef.current = show;
+    for (const sphere of centroidSpheresRef.current) {
+      sphere.visible = show;
+    }
+  }, []);
+
   // Animate camera to cluster
   const flyToCluster = useCallback((target: THREE.Vector3) => {
     if (!cameraRef.current || !controlsRef.current) return;
@@ -324,13 +454,17 @@ export default function Nebula({ onSceneReady, onCameraRef }: NebulaProps) {
     (window as any).__nebulaUpdatePoints = updatePoints;
     (window as any).__nebulaFlyToCluster = flyToCluster;
     (window as any).__nebulaGetScene = () => sceneRef.current;
+    (window as any).__nebulaUpdateClusterColors = updateClusterColors;
+    (window as any).__nebulaToggleCentroids = toggleCentroids;
     
     return () => {
       delete (window as any).__nebulaUpdatePoints;
       delete (window as any).__nebulaFlyToCluster;
       delete (window as any).__nebulaGetScene;
+      delete (window as any).__nebulaUpdateClusterColors;
+      delete (window as any).__nebulaToggleCentroids;
     };
-  }, [updatePoints, flyToCluster]);
+  }, [updatePoints, flyToCluster, updateClusterColors, toggleCentroids]);
 
   return (
     <div 

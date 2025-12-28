@@ -6,7 +6,10 @@
  * - MFCC (Mel-Frequency Cepstral Coefficients) for species differentiation
  * - Pitch detection for harmonic analysis
  * - Multi-dimensional feature space projected to 3D
+ * - DBSCAN clustering for unsupervised source counting
  */
+
+import DBSCAN from '@cdxoo/dbscan';
 
 // Types
 interface InitMessage {
@@ -42,6 +45,15 @@ interface AudioFeatureData {
     category: string;  // 'bird_high', 'bird_low', 'human', 'ambient', etc.
     confidence: number;
   };
+  clusterId?: number; // DBSCAN cluster assignment (-1 = noise)
+}
+
+// Cluster statistics interface
+interface ClusterStats {
+  numDistinctSounds: number;
+  clusterLabels: Int32Array;
+  clusterSizes: Array<{ id: number; size: number }>;
+  clusterCentroids: Array<{ x: number; y: number; z: number }>;
 }
 
 // Shared buffer state
@@ -63,6 +75,13 @@ const featureHistory: AudioFeatureData[] = [];
 
 // Point data storage
 let currentCount = 0;
+
+// DBSCAN clustering state
+let clusterLabels: Int32Array = new Int32Array(MAX_POINTS);
+let lastClusterTime = 0;
+const CLUSTER_INTERVAL = 500; // Run DBSCAN every 500ms for performance
+let dbscanEpsilon = 0.4; // Starting epsilon, will auto-tune
+let lastClusterStats: ClusterStats | null = null;
 
 // Processing state
 let isInitialized = false;
@@ -615,6 +634,175 @@ function computeConfidence(features: ReturnType<typeof extractAudioFeatures>): n
 }
 
 /**
+ * DBSCAN Clustering for Unsupervised Sound Source Counting
+ * 
+ * Runs on 3D positions to identify distinct sound clusters without classification.
+ * Uses silhouette score to auto-tune epsilon parameter.
+ */
+function runDBSCANClustering(): ClusterStats | null {
+  if (currentCount < 10 || !positions) return null;
+  
+  const startTime = performance.now();
+  
+  // Prepare data points as array of [x, y, z]
+  const points: number[][] = [];
+  for (let i = 0; i < currentCount; i++) {
+    points.push([
+      positions[i * 3],
+      positions[i * 3 + 1],
+      positions[i * 3 + 2]
+    ]);
+  }
+  
+  // Run DBSCAN with current epsilon
+  const dbscan = new DBSCAN({
+    epsilon: dbscanEpsilon,
+    minPoints: 5,
+    distanceFunction: euclideanDistance
+  });
+  
+  const labels = dbscan.fit(points);
+  
+  // Calculate cluster statistics
+  const clusterMap = new Map<number, number[]>();
+  let noiseCount = 0;
+  
+  for (let i = 0; i < labels.length; i++) {
+    const label = labels[i];
+    clusterLabels[i] = label;
+    
+    if (label === -1) {
+      noiseCount++;
+    } else {
+      if (!clusterMap.has(label)) {
+        clusterMap.set(label, []);
+      }
+      clusterMap.get(label)!.push(i);
+    }
+    
+    // Update feature history with cluster ID
+    if (featureHistory[i]) {
+      featureHistory[i].clusterId = label;
+    }
+  }
+  
+  // Calculate cluster centroids
+  const clusterCentroids: Array<{ x: number; y: number; z: number }> = [];
+  const clusterSizes: Array<{ id: number; size: number }> = [];
+  
+  clusterMap.forEach((indices, clusterId) => {
+    let sumX = 0, sumY = 0, sumZ = 0;
+    for (const idx of indices) {
+      sumX += positions[idx * 3];
+      sumY += positions[idx * 3 + 1];
+      sumZ += positions[idx * 3 + 2];
+    }
+    const size = indices.length;
+    clusterCentroids.push({
+      x: sumX / size,
+      y: sumY / size,
+      z: sumZ / size
+    });
+    clusterSizes.push({ id: clusterId, size });
+  });
+  
+  // Sort by size descending
+  clusterSizes.sort((a, b) => b.size - a.size);
+  
+  // Calculate silhouette score for auto-tuning (simplified version)
+  const silhouetteScore = calculateSilhouetteScore(points, labels, clusterMap);
+  
+  // Auto-tune epsilon based on silhouette score
+  if (silhouetteScore < 0.3 && clusterMap.size > 1) {
+    // Poor clustering, try larger epsilon (merge more)
+    dbscanEpsilon = Math.min(1.5, dbscanEpsilon * 1.1);
+  } else if (silhouetteScore > 0.7 && clusterMap.size === 1 && noiseCount > currentCount * 0.3) {
+    // Too few clusters with lots of noise, try smaller epsilon
+    dbscanEpsilon = Math.max(0.15, dbscanEpsilon * 0.9);
+  }
+  
+  const elapsed = performance.now() - startTime;
+  
+  const stats: ClusterStats = {
+    numDistinctSounds: clusterMap.size,
+    clusterLabels: clusterLabels.slice(0, currentCount),
+    clusterSizes,
+    clusterCentroids
+  };
+  
+  console.log(`[Worker] DBSCAN: ${clusterMap.size} clusters, ${noiseCount} noise, ε=${dbscanEpsilon.toFixed(2)}, silhouette=${silhouetteScore.toFixed(2)}, ${elapsed.toFixed(1)}ms`);
+  
+  return stats;
+}
+
+/**
+ * Euclidean distance function for DBSCAN
+ */
+function euclideanDistance(a: number[], b: number[]): number {
+  const dx = a[0] - b[0];
+  const dy = a[1] - b[1];
+  const dz = a[2] - b[2];
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/**
+ * Simplified silhouette score calculation
+ * Measures how well-separated clusters are
+ */
+function calculateSilhouetteScore(
+  points: number[][],
+  labels: number[],
+  clusterMap: Map<number, number[]>
+): number {
+  if (clusterMap.size < 2) return 0;
+  
+  let totalScore = 0;
+  let validPoints = 0;
+  
+  // Sample points for performance (max 200)
+  const sampleSize = Math.min(200, points.length);
+  const step = Math.max(1, Math.floor(points.length / sampleSize));
+  
+  for (let i = 0; i < points.length; i += step) {
+    const label = labels[i];
+    if (label === -1) continue; // Skip noise
+    
+    const cluster = clusterMap.get(label)!;
+    if (cluster.length < 2) continue;
+    
+    // a(i) = average distance to points in same cluster
+    let intraClusterDist = 0;
+    for (const j of cluster) {
+      if (i !== j) {
+        intraClusterDist += euclideanDistance(points[i], points[j]);
+      }
+    }
+    const a = intraClusterDist / (cluster.length - 1);
+    
+    // b(i) = minimum average distance to points in other clusters
+    let minInterClusterDist = Infinity;
+    clusterMap.forEach((otherCluster, otherLabel) => {
+      if (otherLabel === label) return;
+      
+      let interDist = 0;
+      for (const j of otherCluster) {
+        interDist += euclideanDistance(points[i], points[j]);
+      }
+      const avgDist = interDist / otherCluster.length;
+      minInterClusterDist = Math.min(minInterClusterDist, avgDist);
+    });
+    const b = minInterClusterDist;
+    
+    // Silhouette coefficient for point i
+    const s = (b - a) / Math.max(a, b);
+    totalScore += s;
+    validPoints++;
+  }
+  
+  return validPoints > 0 ? totalScore / validPoints : 0;
+}
+
+/**
  * Apply spring forces to animate points smoothly toward targets
  */
 function applySpringForces(): void {
@@ -725,6 +913,7 @@ function processAudio(): void {
 // Processing loops
 let processInterval: ReturnType<typeof setInterval> | null = null;
 let physicsInterval: ReturnType<typeof setInterval> | null = null;
+let clusterInterval: ReturnType<typeof setInterval> | null = null;
 
 /**
  * Start processing loops
@@ -749,6 +938,29 @@ function startProcessing(): void {
     }
   }, 33);
   
+  // DBSCAN clustering at 2Hz (every 500ms for performance)
+  clusterInterval = setInterval(() => {
+    const now = Date.now();
+    if (now - lastClusterTime >= CLUSTER_INTERVAL && currentCount >= 10) {
+      lastClusterTime = now;
+      try {
+        const stats = runDBSCANClustering();
+        if (stats) {
+          lastClusterStats = stats;
+          postMessage({
+            type: 'clusters_updated',
+            numDistinctSounds: stats.numDistinctSounds,
+            clusterLabels: stats.clusterLabels,
+            clusterSizes: stats.clusterSizes,
+            clusterCentroids: stats.clusterCentroids
+          });
+        }
+      } catch (e) {
+        console.error('[Worker] DBSCAN error:', e);
+      }
+    }
+  }, 250);
+  
   console.log('[Worker] Processing started');
 }
 
@@ -763,6 +975,10 @@ function stopProcessing(): void {
   if (physicsInterval) {
     clearInterval(physicsInterval);
     physicsInterval = null;
+  }
+  if (clusterInterval) {
+    clearInterval(clusterInterval);
+    clusterInterval = null;
   }
 }
 

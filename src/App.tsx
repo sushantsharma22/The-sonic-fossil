@@ -10,6 +10,12 @@ import * as THREE from 'three';
 
 type Status = 'idle' | 'initializing' | 'listening' | 'processing' | 'error';
 
+// Cluster size type
+interface ClusterSize {
+  id: number;
+  size: number;
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status>('idle');
   const [confidence, setConfidence] = useState(0);
@@ -20,6 +26,11 @@ export default function App() {
   const [currentClass, setCurrentClass] = useState('');
   const [currentPitch, setCurrentPitch] = useState(0);
   const [exportData, setExportData] = useState<any>(null);
+  
+  // Cluster state
+  const [numDistinctSounds, setNumDistinctSounds] = useState(0);
+  const [clusterSizes, setClusterSizes] = useState<ClusterSize[]>([]);
+  const [showCentroids, setShowCentroids] = useState(true);
   
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -54,6 +65,21 @@ export default function App() {
         if (updatePoints && e.data.sab) {
           const positions = new Float32Array(e.data.sab);
           updatePoints(positions, count);
+        }
+      }
+      
+      if (type === 'clusters_updated') {
+        // Handle DBSCAN cluster updates
+        const { numDistinctSounds: nds, clusterLabels, clusterSizes: sizes, clusterCentroids } = e.data;
+        
+        setNumDistinctSounds(nds);
+        setClusterSizes(sizes || []);
+        
+        // Update visualization colors
+        const updateClusterColors = (window as any).__nebulaUpdateClusterColors;
+        if (updateClusterColors && clusterLabels) {
+          const maxCluster = Math.max(0, ...sizes.map((s: ClusterSize) => s.id));
+          updateClusterColors(clusterLabels, clusterCentroids || [], maxCluster);
         }
       }
       
@@ -192,6 +218,66 @@ export default function App() {
           )}
         </div>
       </header>
+
+      {/* Distinct Sounds Counter - Large Display */}
+      {isListening && numDistinctSounds > 0 && (
+        <div className="absolute top-24 right-6 z-10 glass rounded-xl p-4 min-w-[200px]">
+          <div className="text-center">
+            <div className="text-5xl font-extralight text-white/90 tracking-tight">
+              {numDistinctSounds}
+            </div>
+            <div className="text-xs text-white/50 uppercase tracking-widest mt-1">
+              Distinct Sound{numDistinctSounds !== 1 ? 's' : ''} Detected
+            </div>
+          </div>
+          
+          {/* Cluster Size Bar Chart */}
+          {clusterSizes.length > 0 && (
+            <div className="mt-4 space-y-2">
+              <div className="text-[10px] text-white/40 uppercase tracking-wider">Cluster Distribution</div>
+              {clusterSizes.slice(0, 6).map((cluster, index) => {
+                const maxSize = Math.max(...clusterSizes.map(c => c.size));
+                const percentage = (cluster.size / maxSize) * 100;
+                const hue = (cluster.id / Math.max(1, clusterSizes.length)) * 360;
+                return (
+                  <div key={cluster.id} className="flex items-center gap-2">
+                    <div 
+                      className="w-3 h-3 rounded-full flex-shrink-0"
+                      style={{ backgroundColor: `hsl(${hue}, 90%, 60%)` }}
+                    />
+                    <div className="flex-1 h-2 bg-white/5 rounded-full overflow-hidden">
+                      <div 
+                        className="h-full rounded-full transition-all duration-300"
+                        style={{ 
+                          width: `${percentage}%`,
+                          backgroundColor: `hsl(${hue}, 90%, 60%)`
+                        }}
+                      />
+                    </div>
+                    <span className="text-[10px] text-white/40 w-8 text-right">{cluster.size}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          
+          {/* Toggle Centroids */}
+          <button
+            onClick={() => {
+              setShowCentroids(!showCentroids);
+              const toggleCentroids = (window as any).__nebulaToggleCentroids;
+              if (toggleCentroids) {
+                toggleCentroids(!showCentroids);
+              }
+            }}
+            className="mt-3 w-full px-2 py-1.5 text-[10px] rounded-lg border border-white/10
+                       hover:bg-white/5 transition-colors flex items-center justify-center gap-2"
+          >
+            <span className={`w-2 h-2 rounded-full ${showCentroids ? 'bg-green-400' : 'bg-white/20'}`} />
+            <span className="text-white/50">Show Cluster Centers</span>
+          </button>
+        </div>
+      )}
 
       {/* Center Start Button */}
       {!isListening && (
