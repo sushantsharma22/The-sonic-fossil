@@ -106,9 +106,9 @@ export default function Nebula({ onSceneReady, onCameraRef }: NebulaProps) {
     scene.fog = new THREE.FogExp2('#050505', 0.015);
     sceneRef.current = scene;
 
-    // Camera
+    // Camera - positioned further back for expanded space
     const camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 1000);
-    camera.position.set(0, 2, 8);
+    camera.position.set(0, 5, 25);
     cameraRef.current = camera;
     onCameraRef?.(camera);
 
@@ -179,9 +179,12 @@ export default function Nebula({ onSceneReady, onCameraRef }: NebulaProps) {
     // Add ambient particles for atmosphere
     addAmbientParticles(scene);
 
-    // Grid helper (subtle)
-    const gridHelper = new THREE.GridHelper(20, 40, '#111111', '#0a0a0a');
-    gridHelper.position.y = -2;
+    // Add 3D axes with labels for understanding the data
+    add3DAxes(scene);
+
+    // Grid helper (subtle) - expanded for larger space
+    const gridHelper = new THREE.GridHelper(30, 30, '#111111', '#0a0a0a');
+    gridHelper.position.y = -10;
     scene.add(gridHelper);
 
     // Notify parent
@@ -345,9 +348,9 @@ function addAmbientParticles(scene: THREE.Scene) {
   const colors = new Float32Array(count * 3);
 
   for (let i = 0; i < count; i++) {
-    positions[i * 3] = (Math.random() - 0.5) * 40;
-    positions[i * 3 + 1] = (Math.random() - 0.5) * 40;
-    positions[i * 3 + 2] = (Math.random() - 0.5) * 40;
+    positions[i * 3] = (Math.random() - 0.5) * 60;
+    positions[i * 3 + 1] = (Math.random() - 0.5) * 60;
+    positions[i * 3 + 2] = (Math.random() - 0.5) * 60;
 
     // Subtle cyan tint
     colors[i * 3] = 0.0;
@@ -378,4 +381,117 @@ function addAmbientParticles(scene: THREE.Scene) {
     requestAnimationFrame(animate);
   };
   animate();
+}
+
+// Helper: Add 3D axes with labels
+function add3DAxes(scene: THREE.Scene) {
+  const axisLength = 12;
+  const axisOpacity = 0.6;
+  
+  // X Axis (Red) - Pitch/Frequency
+  const xGeometry = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(-axisLength, 0, 0),
+    new THREE.Vector3(axisLength, 0, 0)
+  ]);
+  const xMaterial = new THREE.LineBasicMaterial({ color: '#ff4444', transparent: true, opacity: axisOpacity });
+  const xAxis = new THREE.Line(xGeometry, xMaterial);
+  scene.add(xAxis);
+  
+  // X axis arrow
+  const xArrow = new THREE.ConeGeometry(0.15, 0.5, 8);
+  const xArrowMesh = new THREE.Mesh(xArrow, new THREE.MeshBasicMaterial({ color: '#ff4444' }));
+  xArrowMesh.position.set(axisLength, 0, 0);
+  xArrowMesh.rotation.z = -Math.PI / 2;
+  scene.add(xArrowMesh);
+  
+  // Y Axis (Green) - Harmonic Complexity
+  const yGeometry = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, -axisLength, 0),
+    new THREE.Vector3(0, axisLength, 0)
+  ]);
+  const yMaterial = new THREE.LineBasicMaterial({ color: '#44ff44', transparent: true, opacity: axisOpacity });
+  const yAxis = new THREE.Line(yGeometry, yMaterial);
+  scene.add(yAxis);
+  
+  // Y axis arrow
+  const yArrow = new THREE.ConeGeometry(0.15, 0.5, 8);
+  const yArrowMesh = new THREE.Mesh(yArrow, new THREE.MeshBasicMaterial({ color: '#44ff44' }));
+  yArrowMesh.position.set(0, axisLength, 0);
+  scene.add(yArrowMesh);
+  
+  // Z Axis (Blue) - Temporal Texture
+  const zGeometry = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, 0, -axisLength),
+    new THREE.Vector3(0, 0, axisLength)
+  ]);
+  const zMaterial = new THREE.LineBasicMaterial({ color: '#4444ff', transparent: true, opacity: axisOpacity });
+  const zAxis = new THREE.Line(zGeometry, zMaterial);
+  scene.add(zAxis);
+  
+  // Z axis arrow
+  const zArrow = new THREE.ConeGeometry(0.15, 0.5, 8);
+  const zArrowMesh = new THREE.Mesh(zArrow, new THREE.MeshBasicMaterial({ color: '#4444ff' }));
+  zArrowMesh.position.set(0, 0, axisLength);
+  zArrowMesh.rotation.x = Math.PI / 2;
+  scene.add(zArrowMesh);
+  
+  // Add tick marks and region labels
+  const tickMaterial = new THREE.LineBasicMaterial({ color: '#333333' });
+  
+  for (let i = -10; i <= 10; i += 2) {
+    if (i === 0) continue;
+    
+    // X ticks
+    const xTick = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(i, -0.2, 0),
+      new THREE.Vector3(i, 0.2, 0)
+    ]);
+    scene.add(new THREE.Line(xTick, tickMaterial));
+    
+    // Y ticks
+    const yTick = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-0.2, i, 0),
+      new THREE.Vector3(0.2, i, 0)
+    ]);
+    scene.add(new THREE.Line(yTick, tickMaterial));
+    
+    // Z ticks
+    const zTick = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, -0.2, i),
+      new THREE.Vector3(0, 0.2, i)
+    ]);
+    scene.add(new THREE.Line(zTick, tickMaterial));
+  }
+  
+  // Add region indicator spheres (to show where different species cluster)
+  const regionMaterial = new THREE.MeshBasicMaterial({ 
+    color: '#00ffff', 
+    transparent: true, 
+    opacity: 0.05,
+    side: THREE.DoubleSide
+  });
+  
+  // Songbird region (upper right)
+  const songbirdRegion = new THREE.Mesh(
+    new THREE.SphereGeometry(3, 16, 16),
+    new THREE.MeshBasicMaterial({ color: '#ff6600', transparent: true, opacity: 0.03 })
+  );
+  songbirdRegion.position.set(5, 3, 0);
+  scene.add(songbirdRegion);
+  
+  // Owl region (lower left back)
+  const owlRegion = new THREE.Mesh(
+    new THREE.SphereGeometry(3, 16, 16),
+    new THREE.MeshBasicMaterial({ color: '#6600ff', transparent: true, opacity: 0.03 })
+  );
+  owlRegion.position.set(-5, -3, -3);
+  scene.add(owlRegion);
+  
+  // Human speech region (center top)
+  const humanRegion = new THREE.Mesh(
+    new THREE.SphereGeometry(3, 16, 16),
+    new THREE.MeshBasicMaterial({ color: '#00ff66', transparent: true, opacity: 0.03 })
+  );
+  humanRegion.position.set(0, 5, 0);
+  scene.add(humanRegion);
 }

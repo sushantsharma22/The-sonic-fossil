@@ -2,10 +2,10 @@
  * App.tsx - Sonic Latent Manifold Explorer
  * Apple-style minimalist UI with Glassmorphism
  */
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import Nebula from './Nebula';
 import { AudioEngine } from './AudioEngine';
-import { handleExport } from './Exporter';
+import { handleExport, exportAsJSON, captureScreenshot, exportAsGLB, getCurrentPositions } from './Exporter';
 import * as THREE from 'three';
 
 type Status = 'idle' | 'initializing' | 'listening' | 'processing' | 'error';
@@ -17,10 +17,14 @@ export default function App() {
   const [aiStatus, setAiStatus] = useState('Click to start');
   const [isListening, setIsListening] = useState(false);
   const [workerReady, setWorkerReady] = useState(false);
+  const [currentClass, setCurrentClass] = useState('');
+  const [currentPitch, setCurrentPitch] = useState(0);
+  const [exportData, setExportData] = useState<any>(null);
   
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const audioEngineRef = useRef<AudioEngine | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
 
   // Create audio engine once
   if (!audioEngineRef.current) {
@@ -38,7 +42,7 @@ export default function App() {
     if (!worker) return;
 
     const handleWorkerMessage = (e: MessageEvent) => {
-      const { type, count, message, position } = e.data;
+      const { type, count, message, position, classification, pitch, centroid } = e.data;
       
       console.log('[App] Worker message:', type, { count, message });
       
@@ -53,11 +57,27 @@ export default function App() {
         }
       }
       
+      if (type === 'confidence') {
+        setConfidence(e.data.value || 0);
+        if (classification) {
+          setCurrentClass(classification);
+        }
+        if (pitch) {
+          setCurrentPitch(pitch);
+        }
+      }
+      
       if (type === 'status') {
         setAiStatus(message);
         if (message === 'AI ready' || message === 'Simple mode (no AI)') {
           setStatus('listening');
         }
+      }
+      
+      if (type === 'exportData') {
+        // Received export data from worker
+        setExportData(e.data.data);
+        exportAsJSON(e.data.data);
       }
       
       if (type === 'newCluster' && position) {
@@ -165,6 +185,11 @@ export default function App() {
               {pointCount.toLocaleString()} vectors
             </div>
           )}
+          {currentClass && isListening && (
+            <div className="text-xs text-orange-400/80 mt-1 capitalize">
+              {currentClass.replace(/_/g, ' ')} {currentPitch > 0 && `(${currentPitch.toFixed(0)}Hz)`}
+            </div>
+          )}
         </div>
       </header>
 
@@ -251,28 +276,65 @@ export default function App() {
             </div>
 
             {/* Export Controls */}
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  // Request export data from worker
+                  const worker = audioEngineRef.current?.worker;
+                  if (worker) {
+                    worker.postMessage({ type: 'export' });
+                  }
+                }}
+                disabled={pointCount < 10}
+                className="px-3 py-1.5 text-xs font-light tracking-wide
+                           text-green-400/80 border border-green-400/30 rounded-lg
+                           hover:bg-green-400/10 hover:border-green-400/50 
+                           transition-all duration-300
+                           disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Export session data as JSON for analysis"
+              >
+                JSON
+              </button>
+              <button
+                onClick={() => {
+                  const data = getCurrentPositions();
+                  if (data) {
+                    exportAsGLB(data.positions, data.count);
+                  }
+                }}
+                disabled={pointCount < 10}
+                className="px-3 py-1.5 text-xs font-light tracking-wide
+                           text-purple-400/80 border border-purple-400/30 rounded-lg
+                           hover:bg-purple-400/10 hover:border-purple-400/50 
+                           transition-all duration-300
+                           disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Export as GLB with colors (for 3D viewers)"
+              >
+                GLB
+              </button>
               <button
                 onClick={() => handleExport('stl')}
                 disabled={pointCount < 10}
-                className="px-4 py-2 text-xs font-light tracking-wide
+                className="px-3 py-1.5 text-xs font-light tracking-wide
                            text-cyan/80 border border-cyan/30 rounded-lg
                            hover:bg-cyan/10 hover:border-cyan/50 
                            transition-all duration-300
                            disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Export as STL for 3D printing"
               >
-                Export STL
+                STL
               </button>
               <button
                 onClick={() => handleExport('hull')}
                 disabled={pointCount < 10}
-                className="px-4 py-2 text-xs font-light tracking-wide
+                className="px-3 py-1.5 text-xs font-light tracking-wide
                            text-white/60 border border-white/20 rounded-lg
                            hover:bg-white/5 hover:border-white/30 
                            transition-all duration-300
                            disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Export convex hull as STL"
               >
-                Export Hull
+                Hull
               </button>
             </div>
           </div>
@@ -286,6 +348,36 @@ export default function App() {
           <circle cx="50" cy="50" r="30" fill="none" stroke="currentColor" strokeWidth="0.3" className="text-cyan" />
         </svg>
       </div>
+
+      {/* Axis Legend - bottom left */}
+      {isListening && (
+        <div className="absolute bottom-32 left-6 z-10 glass rounded-lg p-3 text-xs">
+          <div className="text-white/60 font-medium mb-2 uppercase tracking-wider text-[10px]">Axis Guide</div>
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <div className="w-3 h-0.5 bg-red-500"></div>
+              <span className="text-white/50">X: Pitch</span>
+              <span className="text-white/30 text-[10px]">Low ← → High</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="w-3 h-0.5 bg-green-500"></div>
+              <span className="text-white/50">Y: Complexity</span>
+              <span className="text-white/30 text-[10px]">Simple ↓ ↑ Rich</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="w-3 h-0.5 bg-blue-500"></div>
+              <span className="text-white/50">Z: Texture</span>
+              <span className="text-white/30 text-[10px]">Sustained ← → Noisy</span>
+            </div>
+          </div>
+          <div className="mt-3 pt-2 border-t border-white/10 text-[10px] text-white/30">
+            <div>🐦 Songbirds: +X, +Y</div>
+            <div>🦉 Owls: -X, -Y, -Z</div>
+            <div>👤 Human: center X, +Y</div>
+            <div>🦗 Insects: +X, -Y, +Z</div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

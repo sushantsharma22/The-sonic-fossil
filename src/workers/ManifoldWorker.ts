@@ -1,10 +1,11 @@
 /**
  * ManifoldWorker.ts - Web Worker for Audio Analysis + 3D Visualization
  * 
- * Simplified approach:
- * - Direct audio feature extraction (no heavy AI model)
- * - Simple projection to 3D based on audio characteristics
- * - Spring-force physics for smooth animation
+ * Advanced bioacoustic analysis approach:
+ * - FFT-based spectral analysis
+ * - MFCC (Mel-Frequency Cepstral Coefficients) for species differentiation
+ * - Pitch detection for harmonic analysis
+ * - Multi-dimensional feature space projected to 3D
  */
 
 // Types
@@ -20,6 +21,29 @@ interface DisposeMessage {
 
 type WorkerMessage = InitMessage | DisposeMessage;
 
+// Audio feature data sent to main thread for export
+interface AudioFeatureData {
+  timestamp: number;
+  position: [number, number, number];
+  features: {
+    rms: number;
+    spectralCentroid: number;
+    spectralSpread: number;
+    spectralRolloff: number;
+    zeroCrossingRate: number;
+    spectralFlatness: number;
+    pitch: number;
+    mfcc: number[];
+    lowEnergy: number;
+    midEnergy: number;
+    highEnergy: number;
+  };
+  classification: {
+    category: string;  // 'bird_high', 'bird_low', 'human', 'ambient', etc.
+    confidence: number;
+  };
+}
+
 // Shared buffer state
 let audioSAB: SharedArrayBuffer;
 let writeIndex: Int32Array;
@@ -33,6 +57,9 @@ let positionsSAB: SharedArrayBuffer | null = null;
 let positions: Float32Array | null = null;
 let velocities: Float32Array | null = null;
 let targetPositions: Float32Array | null = null;
+
+// Feature history for export
+const featureHistory: AudioFeatureData[] = [];
 
 // Point data storage
 let currentCount = 0;
@@ -179,9 +206,12 @@ function extractAudioFeatures(samples: Float32Array): {
   spectralRolloff: number;   // Frequency below which 85% of energy is contained
   zeroCrossingRate: number;  // Related to noisiness/pitch
   spectralFlatness: number;  // Tonality (0=tonal, 1=noise)
+  pitch: number;         // Fundamental frequency estimate (Hz)
+  mfcc: number[];        // Mel-frequency cepstral coefficients (13 coefficients)
   lowEnergy: number;     // Energy in bass (20-300 Hz)
   midEnergy: number;     // Energy in mids (300-2000 Hz)  
   highEnergy: number;    // Energy in highs (2000-8000 Hz)
+  veryHighEnergy: number; // Ultra-high (8000-20000 Hz) - birds/bats
 } {
   const n = samples.length;
   
@@ -260,20 +290,29 @@ function extractAudioFeatures(samples: Float32Array): {
   const lowBin = Math.floor(300 / binFreq);      // 0-300 Hz (bass)
   const midBin = Math.floor(2000 / binFreq);     // 300-2000 Hz (mids)
   const highBin = Math.floor(8000 / binFreq);    // 2000-8000 Hz (highs)
+  const veryHighBin = Math.floor(20000 / binFreq); // 8000-20000 Hz (birds/bats)
   
-  let lowEnergy = 0, midEnergy = 0, highEnergy = 0;
-  for (let i = 0; i < spectrum.length && i < highBin; i++) {
+  let lowEnergy = 0, midEnergy = 0, highEnergy = 0, veryHighEnergy = 0;
+  for (let i = 0; i < spectrum.length; i++) {
     const e = spectrum[i] * spectrum[i];
     if (i < lowBin) lowEnergy += e;
     else if (i < midBin) midEnergy += e;
-    else highEnergy += e;
+    else if (i < highBin) highEnergy += e;
+    else if (i < veryHighBin) veryHighEnergy += e;
   }
   
   // Normalize energies
-  const maxE = Math.max(lowEnergy, midEnergy, highEnergy, 1e-10);
-  lowEnergy = Math.sqrt(lowEnergy) / Math.sqrt(maxE);
-  midEnergy = Math.sqrt(midEnergy) / Math.sqrt(maxE);
-  highEnergy = Math.sqrt(highEnergy) / Math.sqrt(maxE);
+  const totalE = lowEnergy + midEnergy + highEnergy + veryHighEnergy + 1e-10;
+  lowEnergy = Math.sqrt(lowEnergy / totalE);
+  midEnergy = Math.sqrt(midEnergy / totalE);
+  highEnergy = Math.sqrt(highEnergy / totalE);
+  veryHighEnergy = Math.sqrt(veryHighEnergy / totalE);
+  
+  // 9. Pitch Detection using autocorrelation
+  const pitch = detectPitch(samples, sampleRate);
+  
+  // 10. MFCC - Mel-frequency cepstral coefficients (crucial for species ID)
+  const mfcc = computeMFCC(spectrum, sampleRate, fftSize, 13);
   
   return {
     rms,
@@ -282,60 +321,266 @@ function extractAudioFeatures(samples: Float32Array): {
     spectralRolloff,
     zeroCrossingRate,
     spectralFlatness,
+    pitch,
+    mfcc,
     lowEnergy,
     midEnergy,
-    highEnergy
+    highEnergy,
+    veryHighEnergy
   };
 }
 
 /**
- * Map audio features to 3D position using perceptually meaningful axes
+ * Pitch detection using autocorrelation method
+ * Good for harmonic sounds (birds, humans)
+ */
+function detectPitch(samples: Float32Array, sr: number): number {
+  const n = samples.length;
+  const minLag = Math.floor(sr / 8000);  // Max 8kHz
+  const maxLag = Math.floor(sr / 50);    // Min 50Hz
+  
+  let bestCorr = 0;
+  let bestLag = 0;
+  
+  for (let lag = minLag; lag < maxLag && lag < n / 2; lag++) {
+    let corr = 0;
+    for (let i = 0; i < n - lag; i++) {
+      corr += samples[i] * samples[i + lag];
+    }
+    corr /= (n - lag);
+    
+    if (corr > bestCorr) {
+      bestCorr = corr;
+      bestLag = lag;
+    }
+  }
+  
+  return bestLag > 0 ? sr / bestLag : 0;
+}
+
+/**
+ * Compute Mel-Frequency Cepstral Coefficients
+ * Standard feature for audio/speech/species classification
+ */
+function computeMFCC(spectrum: Float32Array, sr: number, fftSize: number, numCoeffs: number): number[] {
+  const numFilters = 26;
+  const minFreq = 20;
+  const maxFreq = Math.min(sr / 2, 20000);
+  
+  // Mel scale conversion
+  const freqToMel = (f: number) => 2595 * Math.log10(1 + f / 700);
+  const melToFreq = (m: number) => 700 * (Math.pow(10, m / 2595) - 1);
+  
+  const minMel = freqToMel(minFreq);
+  const maxMel = freqToMel(maxFreq);
+  
+  // Create mel filter bank
+  const melPoints = new Array(numFilters + 2);
+  for (let i = 0; i < numFilters + 2; i++) {
+    melPoints[i] = melToFreq(minMel + (maxMel - minMel) * i / (numFilters + 1));
+  }
+  
+  // Convert to FFT bins
+  const binPoints = melPoints.map(f => Math.floor((fftSize + 1) * f / sr));
+  
+  // Apply mel filters
+  const melEnergies = new Array(numFilters).fill(0);
+  for (let m = 0; m < numFilters; m++) {
+    const startBin = binPoints[m];
+    const peakBin = binPoints[m + 1];
+    const endBin = binPoints[m + 2];
+    
+    for (let k = startBin; k < peakBin && k < spectrum.length; k++) {
+      const weight = (k - startBin) / (peakBin - startBin + 1e-10);
+      melEnergies[m] += spectrum[k] * spectrum[k] * weight;
+    }
+    for (let k = peakBin; k < endBin && k < spectrum.length; k++) {
+      const weight = (endBin - k) / (endBin - peakBin + 1e-10);
+      melEnergies[m] += spectrum[k] * spectrum[k] * weight;
+    }
+    
+    // Log compression
+    melEnergies[m] = Math.log(melEnergies[m] + 1e-10);
+  }
+  
+  // DCT to get cepstral coefficients
+  const mfcc = new Array(numCoeffs).fill(0);
+  for (let i = 0; i < numCoeffs; i++) {
+    for (let j = 0; j < numFilters; j++) {
+      mfcc[i] += melEnergies[j] * Math.cos(Math.PI * i * (j + 0.5) / numFilters);
+    }
+    mfcc[i] *= Math.sqrt(2 / numFilters);
+  }
+  
+  return mfcc;
+}
+
+/**
+ * Classify sound based on features
+ * Returns category and confidence
+ */
+function classifySound(features: ReturnType<typeof extractAudioFeatures>): { category: string; confidence: number } {
+  const { spectralCentroid, pitch, spectralFlatness, mfcc, lowEnergy, highEnergy, veryHighEnergy, rms } = features;
+  
+  let category = 'unknown';
+  let confidence = 0;
+  
+  // High-frequency dominant with harmonic content → Bird (high pitched)
+  if (spectralCentroid > 3000 && veryHighEnergy > 0.3 && spectralFlatness < 0.5) {
+    if (pitch > 2000) {
+      category = 'bird_songbird';
+      confidence = 0.7 + (veryHighEnergy * 0.3);
+    } else if (pitch > 500 && pitch < 2000) {
+      category = 'bird_owl';
+      confidence = 0.6 + ((1 - spectralFlatness) * 0.3);
+    } else {
+      category = 'bird_other';
+      confidence = 0.5;
+    }
+  }
+  // Mid-frequency with formants (MFCC pattern) → Human/speech
+  else if (spectralCentroid > 500 && spectralCentroid < 3000 && lowEnergy < 0.5 && spectralFlatness < 0.4) {
+    // Check for formant-like structure in MFCCs
+    const mfccVariance = mfcc.slice(1, 6).reduce((a, b) => a + b * b, 0) / 5;
+    if (mfccVariance > 1) {
+      category = 'human_speech';
+      confidence = 0.6 + Math.min(0.3, mfccVariance / 10);
+    } else {
+      category = 'human_other';
+      confidence = 0.5;
+    }
+  }
+  // Low frequency dominant → Large animal or machinery
+  else if (lowEnergy > 0.5 && spectralCentroid < 500) {
+    if (spectralFlatness > 0.6) {
+      category = 'ambient_machinery';
+      confidence = 0.5 + (spectralFlatness * 0.3);
+    } else {
+      category = 'animal_large';
+      confidence = 0.5 + (lowEnergy * 0.3);
+    }
+  }
+  // High flatness → Noise/ambient
+  else if (spectralFlatness > 0.7) {
+    category = 'ambient_noise';
+    confidence = 0.4 + (spectralFlatness * 0.3);
+  }
+  // Insects have very high frequencies and rhythmic patterns
+  else if (veryHighEnergy > 0.4 && spectralFlatness > 0.3) {
+    category = 'insect';
+    confidence = 0.5 + (veryHighEnergy * 0.3);
+  }
+  else {
+    category = 'unknown';
+    confidence = 0.3;
+  }
+  
+  // Adjust confidence by signal strength
+  confidence *= Math.min(1, rms * 5 + 0.3);
+  
+  return { category, confidence: Math.min(1, confidence) };
+}
+
+/**
+ * Map audio features to 3D position - EXPANDED SPACE for better separation
  * 
- * Scientific basis:
- * - X axis: Spectral Centroid (brightness/timbre)
- *   Bird chirps → high X (bright), Low rumbles → low X (dark)
+ * Axes designed for species differentiation:
  * 
- * - Y axis: Energy/Loudness (RMS)
- *   Loud sounds → high Y, Quiet sounds → low Y
+ * X axis: PITCH / FREQUENCY CHARACTER (-10 to +10)
+ *   - Low-pitched (owls, large animals) → -X
+ *   - High-pitched (songbirds, insects) → +X
  * 
- * - Z axis: Spectral Flatness (tonality)
- *   Pure tones → low Z, Noisy sounds → high Z
+ * Y axis: HARMONIC COMPLEXITY / TONALITY (-10 to +10)
+ *   - Pure tones (whistles, single notes) → -Y
+ *   - Complex harmonics (speech, rich calls) → +Y
  * 
- * This creates natural clustering:
- * - Bird songs: High X, Variable Y, Low-Mid Z (bright, tonal)
- * - Wind/water: Mid X, Low Y, High Z (broadband noise)
- * - Speech: Mid X, Mid Y, Mid Z (complex harmonic)
+ * Z axis: TEMPORAL TEXTURE (-10 to +10)
+ *   - Sustained sounds → -Z
+ *   - Transient/noisy sounds → +Z
+ * 
+ * This creates CLEAR SEPARATION:
+ *   - Songbirds: +X (high), +Y (complex), variable Z → Upper right
+ *   - Owls: -X (low), -Y (pure), -Z (sustained) → Lower left back
+ *   - Human speech: center X, +Y (very complex), center Z
+ *   - Insects: +X (very high), -Y (simple), +Z (buzzy)
+ *   - Ambient noise: spread across Z axis
  */
 function featuresToPosition(features: ReturnType<typeof extractAudioFeatures>): [number, number, number] {
-  // Normalize spectral centroid to [-3, 3]
-  // Typical range: 500 Hz (dark) to 5000 Hz (bright)
-  // Bird chirps: 2000-8000 Hz → will be positive X
-  const centroidNorm = Math.log10(Math.max(features.spectralCentroid, 100)) - 3; // log scale
-  let x = centroidNorm * 2.5;
+  const { spectralCentroid, pitch, spectralFlatness, spectralSpread, 
+          mfcc, lowEnergy, midEnergy, highEnergy, veryHighEnergy, rms } = features;
   
-  // Normalize RMS to [-3, 3]
-  // Use log scale for perceptual loudness (dB-like)
-  const rmsDb = 20 * Math.log10(Math.max(features.rms, 1e-6));
-  // Typical range: -60 dB (very quiet) to 0 dB (max)
-  let y = (rmsDb + 40) / 15; // Maps -60dB→-2.7, -10dB→+2
+  // === X AXIS: Pitch/Frequency Character ===
+  // Use combination of pitch and spectral centroid
+  // Log scale to spread out the range
+  let x = 0;
+  if (pitch > 0) {
+    // Pitch-based (50Hz to 8000Hz → -8 to +8)
+    x = (Math.log2(Math.max(pitch, 50)) - 5.6) * 2.5;
+  } else {
+    // Fallback to spectral centroid
+    x = (Math.log10(Math.max(spectralCentroid, 100)) - 2.7) * 5;
+  }
+  // Boost from very high frequency content (birds/insects)
+  x += veryHighEnergy * 3;
+  // Low energy pulls left
+  x -= lowEnergy * 2;
   
-  // Spectral flatness to Z axis [-3, 3]
-  // 0 = pure tone, 1 = white noise
-  let z = (features.spectralFlatness - 0.5) * 6;
+  // === Y AXIS: Harmonic Complexity ===
+  // Use MFCCs to measure harmonic richness
+  // Higher variance = more complex harmonics
+  const mfccEnergy = mfcc.slice(1, 8).reduce((a, b) => a + Math.abs(b), 0) / 7;
+  const mfccVariance = mfcc.slice(1, 6).reduce((a, b, i) => {
+    return a + Math.abs(b - (mfcc[i] || 0));
+  }, 0) / 5;
   
-  // Secondary modulation based on band energies
-  // High frequency energy pushes slightly up and right
-  x += features.highEnergy * 0.5;
-  y += (features.midEnergy - features.lowEnergy) * 0.3;
+  let y = 0;
+  // Tonal (low flatness) sounds go down, noisy go up
+  y = (1 - spectralFlatness) * 5 - 2.5;
+  // MFCC complexity pushes up
+  y += mfccEnergy * 0.5;
+  y += mfccVariance * 0.3;
+  // Loudness slight influence
+  const rmsDb = 20 * Math.log10(Math.max(rms, 1e-6));
+  y += (rmsDb + 40) / 20;
   
-  // Spread affects Z - wide spectrum sounds spread more in Z
-  const spreadNorm = features.spectralSpread / 2000;
-  z += (spreadNorm - 0.5) * 0.5;
+  // === Z AXIS: Temporal Texture / Spectral Spread ===
+  // Narrow spread = sustained tone → back (-Z)
+  // Wide spread = transient/noise → front (+Z)
+  let z = 0;
+  z = (spectralSpread / 1500 - 1) * 5;
+  // High flatness (noise) pushes forward
+  z += spectralFlatness * 4 - 2;
+  // Mid energy concentration pulls back
+  z -= midEnergy * 2;
   
-  // Clamp to visualization bounds
-  x = Math.max(-4, Math.min(4, x));
-  y = Math.max(-4, Math.min(4, y));
-  z = Math.max(-4, Math.min(4, z));
+  // === Apply category-based clustering offsets ===
+  // This ensures different species END UP in different regions
+  const classification = classifySound(features);
+  switch (classification.category) {
+    case 'bird_songbird':
+      x += 2; y += 1; // Push to upper right
+      break;
+    case 'bird_owl':
+      x -= 3; y -= 2; z -= 2; // Lower left back
+      break;
+    case 'human_speech':
+      y += 3; // Strong push up (complex harmonics)
+      break;
+    case 'insect':
+      x += 3; y -= 2; z += 2; // Right, lower, front
+      break;
+    case 'animal_large':
+      x -= 3; y += 1; z -= 1; // Left
+      break;
+    case 'ambient_noise':
+      z += 3; // Push to front
+      break;
+  }
+  
+  // === Clamp to expanded visualization bounds ===
+  x = Math.max(-10, Math.min(10, x));
+  y = Math.max(-10, Math.min(10, y));
+  z = Math.max(-10, Math.min(10, z));
   
   return [x, y, z];
 }
@@ -412,12 +657,42 @@ function processAudio(): void {
     
     currentCount++;
     
-    // Log with scientific context
-    console.log(`[Worker] Point ${currentCount} → X:${pos[0].toFixed(2)} (brightness) Y:${pos[1].toFixed(2)} (loudness) Z:${pos[2].toFixed(2)} (tonality) | Centroid:${features.spectralCentroid.toFixed(0)}Hz RMS:${(features.rms * 100).toFixed(1)}%`);
+    // Classify the sound
+    const classification = classifySound(features);
     
-    // Send confidence
+    // Store feature data for export
+    const featureData: AudioFeatureData = {
+      timestamp: now,
+      position: pos,
+      features: {
+        rms: features.rms,
+        spectralCentroid: features.spectralCentroid,
+        spectralSpread: features.spectralSpread,
+        spectralRolloff: features.spectralRolloff,
+        zeroCrossingRate: features.zeroCrossingRate,
+        spectralFlatness: features.spectralFlatness,
+        pitch: features.pitch,
+        mfcc: features.mfcc,
+        lowEnergy: features.lowEnergy,
+        midEnergy: features.midEnergy,
+        highEnergy: features.highEnergy
+      },
+      classification
+    };
+    featureHistory.push(featureData);
+    
+    // Log with classification
+    console.log(`[Worker] #${currentCount} ${classification.category} (${(classification.confidence * 100).toFixed(0)}%) → [${pos[0].toFixed(1)}, ${pos[1].toFixed(1)}, ${pos[2].toFixed(1)}] | Pitch:${features.pitch.toFixed(0)}Hz Centroid:${features.spectralCentroid.toFixed(0)}Hz`);
+    
+    // Send confidence and classification
     const confidence = computeConfidence(features);
-    postMessage({ type: 'confidence', value: confidence });
+    postMessage({ 
+      type: 'confidence', 
+      value: confidence,
+      classification: classification.category,
+      pitch: features.pitch,
+      centroid: features.spectralCentroid
+    });
     
     // Notify about new cluster periodically for camera animation
     if (currentCount % 30 === 0) {
@@ -473,6 +748,13 @@ function stopProcessing(): void {
   }
 }
 
+// Types for messages
+interface ExportMessage {
+  type: 'export';
+}
+
+type WorkerMessage = InitMessage | DisposeMessage | ExportMessage;
+
 /**
  * Handle messages from main thread
  */
@@ -502,6 +784,41 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
       // Start processing
       startProcessing();
       break;
+    
+    case 'export':
+      // Send all feature history for JSON export
+      postMessage({
+        type: 'exportData',
+        data: {
+          metadata: {
+            exportDate: new Date().toISOString(),
+            sampleRate,
+            totalPoints: currentCount,
+            sessionDuration: featureHistory.length > 0 
+              ? (featureHistory[featureHistory.length - 1].timestamp - featureHistory[0].timestamp) / 1000 
+              : 0
+          },
+          points: featureHistory,
+          axisInfo: {
+            x: { label: 'Pitch/Frequency', unit: 'log Hz', range: [-10, 10], description: 'Low pitch → -X, High pitch → +X' },
+            y: { label: 'Harmonic Complexity', unit: 'MFCC variance', range: [-10, 10], description: 'Simple tones → -Y, Complex harmonics → +Y' },
+            z: { label: 'Temporal Texture', unit: 'spectral spread', range: [-10, 10], description: 'Sustained → -Z, Transient/noisy → +Z' }
+          },
+          categoryLegend: {
+            'bird_songbird': 'High-pitched birds (sparrows, finches)',
+            'bird_owl': 'Low-pitched birds (owls, pigeons)',
+            'bird_other': 'Other bird calls',
+            'human_speech': 'Human voice/speech',
+            'human_other': 'Other human sounds',
+            'animal_large': 'Large animals (low frequency)',
+            'insect': 'Insects (cicadas, crickets)',
+            'ambient_noise': 'Environmental noise',
+            'ambient_machinery': 'Mechanical/urban sounds',
+            'unknown': 'Unclassified sounds'
+          }
+        }
+      });
+      break;
       
     case 'dispose':
       console.log('[Worker] Disposing...');
@@ -513,6 +830,7 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
       velocities = null;
       targetPositions = null;
       currentCount = 0;
+      featureHistory.length = 0;
       isInitialized = false;
       break;
   }

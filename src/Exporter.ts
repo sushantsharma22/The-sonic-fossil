@@ -1,9 +1,10 @@
 /**
- * Exporter.ts - STL Export utility for 3D-printable Sonic Fossils
- * Converts the point cloud into a mesh suitable for 3D printing
+ * Exporter.ts - Export utilities for Sonic Fossil
+ * Supports: STL (3D print), JSON (data), Screenshot (image), GLB (3D with color)
  */
 import * as THREE from 'three';
 import { STLExporter } from 'three/examples/jsm/exporters/STLExporter.js';
+import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 
 export interface ExportOptions {
   filename?: string;
@@ -16,7 +17,7 @@ export interface ExportOptions {
 const defaultOptions: Required<ExportOptions> = {
   filename: 'sonic_fossil',
   scale: 10,
-  sphereRadius: 0.1,
+  sphereRadius: 0.02, // Small spheres for fine "dust" look
   sphereDetail: 1,
   binary: true,
 };
@@ -257,4 +258,119 @@ export function handleExport(format: 'stl' | 'hull' = 'stl'): void {
   } else {
     exportPointCloudAsSTL(data.positions, data.count, { filename });
   }
+}
+
+/**
+ * Export session data as JSON for analysis
+ */
+export function exportAsJSON(data: any): void {
+  const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '');
+  const filename = `sonic_fossil_data_${timestamp}.json`;
+  
+  const jsonStr = JSON.stringify(data, null, 2);
+  const blob = new Blob([jsonStr], { type: 'application/json' });
+  downloadBlob(blob, filename);
+  
+  console.log(`[Exporter] JSON exported: ${filename} (${(jsonStr.length / 1024).toFixed(1)} KB)`);
+}
+
+/**
+ * Capture screenshot of the canvas
+ */
+export function captureScreenshot(renderer: THREE.WebGLRenderer): void {
+  const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '');
+  const filename = `sonic_fossil_${timestamp}.png`;
+  
+  // Get canvas data URL
+  const dataURL = renderer.domElement.toDataURL('image/png');
+  
+  // Convert to blob and download
+  fetch(dataURL)
+    .then(res => res.blob())
+    .then(blob => {
+      downloadBlob(blob, filename);
+      console.log(`[Exporter] Screenshot saved: ${filename}`);
+    });
+}
+
+/**
+ * Export as GLB (GLTF binary) with colors preserved
+ */
+export function exportAsGLB(
+  positions: Float32Array,
+  count: number,
+  options: ExportOptions = {}
+): void {
+  const opts = { ...defaultOptions, ...options };
+  
+  // Create scene with colored spheres
+  const exportScene = new THREE.Scene();
+  
+  // Group points by approximate position for coloring
+  const sphereGeometry = new THREE.IcosahedronGeometry(opts.sphereRadius * opts.scale, opts.sphereDetail);
+  
+  for (let i = 0; i < count; i++) {
+    const x = positions[i * 3] * opts.scale;
+    const y = positions[i * 3 + 1] * opts.scale;
+    const z = positions[i * 3 + 2] * opts.scale;
+    
+    // Color based on position (for visual clustering)
+    const hue = (Math.atan2(z, x) + Math.PI) / (2 * Math.PI); // 0-1 based on XZ angle
+    const saturation = 0.7;
+    const lightness = 0.5 + y / (opts.scale * 20); // Brighter at top
+    
+    const color = new THREE.Color().setHSL(hue, saturation, Math.max(0.2, Math.min(0.8, lightness)));
+    
+    const material = new THREE.MeshStandardMaterial({ 
+      color,
+      metalness: 0.3,
+      roughness: 0.7,
+      emissive: color,
+      emissiveIntensity: 0.2
+    });
+    
+    const sphere = new THREE.Mesh(sphereGeometry.clone(), material);
+    sphere.position.set(x, y, z);
+    exportScene.add(sphere);
+  }
+  
+  // Add lights for better GLB viewing
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+  exportScene.add(ambientLight);
+  
+  const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  directionalLight.position.set(10, 10, 10);
+  exportScene.add(directionalLight);
+  
+  // Export
+  const exporter = new GLTFExporter();
+  exporter.parse(
+    exportScene,
+    (result) => {
+      const blob = new Blob([result as ArrayBuffer], { type: 'application/octet-stream' });
+      const timestamp = new Date().toISOString().slice(0, 10);
+      downloadBlob(blob, `${opts.filename}_${timestamp}.glb`);
+      console.log(`[Exporter] GLB exported with ${count} colored points`);
+    },
+    (error) => {
+      console.error('[Exporter] GLB export failed:', error);
+    },
+    { binary: true }
+  );
+  
+  // Cleanup
+  sphereGeometry.dispose();
+}
+
+/**
+ * Get renderer from Nebula component
+ */
+export function getRenderer(): THREE.WebGLRenderer | null {
+  // Try to get renderer from the Nebula component's canvas
+  const canvas = document.querySelector('canvas');
+  if (!canvas) return null;
+  
+  // The renderer is attached to the canvas in Nebula
+  // We need to access it through the window global
+  return (window as any).__nebulaRenderer || null;
 }
